@@ -1,0 +1,45 @@
+{
+  "name": "@socialseal/cli",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "SocialSeal CLI (non-interactive)",
+  "keywords": [
+    "socialseal",
+    "cli",
+    "analytics",
+    "video"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/socialseal/socialseal-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/socialseal/socialseal-cli/issues"
+  },
+  "homepage": "https://github.com/socialseal/socialseal-cli#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "bin": {
+    "socialseal": "src/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "ws": "^8.16.0"
+  }
+}
