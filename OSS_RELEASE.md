@@ -9,4 +9,4 @@
 
 ## Publish
 - `npm publish --access public` (scoped package).
-- Tag the release (e.g. `v0.1.0`) and publish release notes.
+- Tag the release (e.g. `v0.1.1`) and publish release notes.

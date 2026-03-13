@@ -11,7 +11,8 @@ const DEFAULT_API_BASE = 'https://api.socialseal.co';
 const CLI_KEY_HEADER = 'X-CLI-Key';
 const WORKSPACE_HEADER = 'X-Workspace-Id';
 const DEFAULT_TIMEOUT_MS = 30000;
-const MAX_TIMEOUT_MS = 300000;
+const DEFAULT_AGENT_IDLE_TIMEOUT_MS = 300000;
+const MAX_TIMEOUT_MS = 900000;
 const LEGACY_ENABLED = process.env.SOCIALSEAL_ENABLE_LEGACY === '1';
 const EXIT_CODES = {
   OK: 0,
@@ -22,7 +23,40 @@ const EXIT_CODES = {
   SERVER: 5,
 };
 const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
-const KNOWN_TOOLS = [];
+const KNOWN_TOOLS = [
+  { name: 'agent-tool-jobs', category: 'agent', description: 'Poll queued agent-backed tool jobs and fetch their results.' },
+  { name: 'deep-exploration-runs', category: 'agent', description: 'Read or persist deep exploration render runs.' },
+  { name: 'workspace-notes', category: 'agent', description: 'Search, create, update, and pin workspace note memory.' },
+  { name: 'workspace-onboarding', category: 'agent', description: 'Read or update workspace onboarding metadata used by the agent.' },
+  { name: 'brand-group-management', category: 'brand', description: 'Manage brand groups, aliases, competitors, and rule configuration.' },
+  { name: 'enqueue-brand-metrics-backfill', category: 'brand', description: 'Queue backfill jobs for brand metrics refreshes.' },
+  { name: 'export-report', category: 'export', description: 'Generate report exports (csv/json/markdown/html/excel_data).' },
+  { name: 'export_tracking_data', category: 'export', description: 'Stream tracking exports as CSV for a group or tracking item.' },
+  { name: 'douyin-geo-api', category: 'search', description: 'Query Douyin search and geo data.' },
+  { name: 'google-ai-search', category: 'search', description: 'Run Google AI search queries and fetch result snapshots.' },
+  { name: 'instagram-geo-api', category: 'search', description: 'Query Instagram search and geo data.' },
+  { name: 'tiktok-geo-api', category: 'search', description: 'Query TikTok search and geo data.' },
+  { name: 'xhs-geo-api', category: 'search', description: 'Query Xiaohongshu search and geo data.' },
+  { name: 'youtube-geo-api', category: 'search', description: 'Query YouTube search and geo data.' },
+  { name: 'group-management', category: 'tracking', description: 'Create, update, list, and delete tracking groups and memberships.' },
+  { name: 'tracking', category: 'tracking', description: 'Create, update, list, refresh, and delete tracking items.' },
+  { name: 'journey-feedback', category: 'vnext', description: 'Record acceptance or rejection feedback for opportunity bundles.' },
+  { name: 'opportunity-bundle-approve', category: 'vnext', description: 'Approve an opportunity bundle and create tracking coverage.' },
+  { name: 'search-journey-run', category: 'vnext', description: 'Run a search journey for a subject across supported platforms.' },
+  { name: 'vnext-blueprints-create', category: 'vnext', description: 'Create a vNext blueprint from grounded evidence.' },
+  { name: 'vnext-blueprints-generate', category: 'vnext', description: 'Generate a vNext blueprint from workspace opportunity data.' },
+  { name: 'vnext-blueprints-read', category: 'vnext', description: 'Read vNext blueprint history and specific versions.' },
+  { name: 'vnext-briefs-create', category: 'vnext', description: 'Create a vNext brief record.' },
+  { name: 'vnext-briefs-generate', category: 'vnext', description: 'Generate a vNext brief from a blueprint or opportunity.' },
+  { name: 'vnext-briefs-read', category: 'vnext', description: 'Read generated vNext briefs and version history.' },
+  { name: 'vnext-intents', category: 'vnext', description: 'List, create, update, or delete vNext intents.' },
+  { name: 'vnext-journeys', category: 'vnext', description: 'List journey runs and inspect their latest outputs.' },
+  { name: 'vnext-keywords', category: 'vnext', description: 'List, create, update, or delete vNext keywords.' },
+  { name: 'vnext-personas', category: 'vnext', description: 'List, create, update, retire, or reactivate vNext personas.' },
+  { name: 'vnext-pillars', category: 'vnext', description: 'List, create, update, or delete vNext content pillars.' },
+  { name: 'vnext-topics', category: 'vnext', description: 'Manage topics, assignments, queues, and topic suggestions.' },
+  { name: 'vnext-topics-auto-tag', category: 'vnext', description: 'Auto-tag keyword and topic assignments with Gemini-assisted review.' },
+];
 
 function loadConfig() {
   const configPath = process.env.SOCIALSEAL_CONFIG || DEFAULT_CONFIG_PATH;
@@ -76,17 +110,41 @@ function normalizeMethod(method) {
   return normalized;
 }
 
-function resolveTimeoutMs(opts, config) {
-  const raw = opts.timeout ?? process.env.SOCIALSEAL_TIMEOUT_MS ?? config.timeoutMs;
-  if (raw == null || raw === '') return DEFAULT_TIMEOUT_MS;
+function parseTimeoutMs(raw, { defaultValue = DEFAULT_TIMEOUT_MS, label = 'timeout' } = {}) {
+  if (raw == null || raw === '') return defaultValue;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new CliError('Invalid timeout value. Use a positive number of milliseconds.', {
+    throw new CliError(`Invalid ${label} value. Use a positive number of milliseconds.`, {
       code: 'INVALID_TIMEOUT',
       exitCode: EXIT_CODES.USAGE,
     });
   }
   return Math.min(parsed, MAX_TIMEOUT_MS);
+}
+
+function resolveTimeoutMs(opts, config) {
+  const raw = opts.timeout ?? process.env.SOCIALSEAL_TIMEOUT_MS ?? config.timeoutMs;
+  return parseTimeoutMs(raw, { defaultValue: DEFAULT_TIMEOUT_MS, label: 'timeout' });
+}
+
+function resolveAgentIdleTimeoutMs(opts, config, fallbackTimeoutMs) {
+  const explicitIdleTimeout =
+    opts.idleTimeout
+    ?? process.env.SOCIALSEAL_AGENT_IDLE_TIMEOUT_MS
+    ?? config.agentIdleTimeoutMs;
+  if (explicitIdleTimeout != null && explicitIdleTimeout !== '') {
+    return parseTimeoutMs(explicitIdleTimeout, {
+      defaultValue: DEFAULT_AGENT_IDLE_TIMEOUT_MS,
+      label: 'idle timeout',
+    });
+  }
+
+  const explicitTimeout = opts.timeout ?? process.env.SOCIALSEAL_TIMEOUT_MS ?? config.timeoutMs;
+  if (explicitTimeout != null && explicitTimeout !== '') {
+    return fallbackTimeoutMs;
+  }
+
+  return DEFAULT_AGENT_IDLE_TIMEOUT_MS;
 }
 
 function resolveLegacyUrl(value, label) {
@@ -99,6 +157,52 @@ function resolveLegacyUrl(value, label) {
     });
   }
   return value;
+}
+
+function emitInfo(opts, message) {
+  if (opts?.verbose) {
+    process.stderr.write(`[socialseal] ${message}\n`);
+  }
+}
+
+function formatCloseReason(reason) {
+  if (reason == null) return '';
+  if (Buffer.isBuffer(reason)) return reason.toString('utf8');
+  if (typeof reason === 'string') return reason;
+  return String(reason);
+}
+
+async function readNodeResponseBody(response, limit = 2000) {
+  if (!response) return null;
+
+  return await new Promise((resolve) => {
+    const chunks = [];
+    let bufferedBytes = 0;
+    let totalBytes = 0;
+    let settled = false;
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    response.on('data', (chunk) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      totalBytes += buffer.length;
+      if (bufferedBytes >= limit) return;
+
+      const remaining = limit - bufferedBytes;
+      const slice = buffer.subarray(0, remaining);
+      chunks.push(slice);
+      bufferedBytes += slice.length;
+    });
+    response.on('end', () => {
+      const text = chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : '';
+      finish(totalBytes > limit ? `${text}…` : text);
+    });
+    response.on('error', () => finish(null));
+  });
 }
 
 function parseJsonInput(value, { label = 'payload', allowString = false } = {}) {
@@ -231,7 +335,11 @@ function emitError(err, opts = {}) {
     process.stderr.write(`[socialseal] ${payload.error.hint}\n`);
   }
   if (showDetails && payload.error.details) {
-    process.stderr.write(`[socialseal] Details: ${payload.error.details}\n`);
+    const detailsText =
+      typeof payload.error.details === 'string'
+        ? payload.error.details
+        : JSON.stringify(payload.error.details);
+    process.stderr.write(`[socialseal] Details: ${detailsText}\n`);
   } else if (!showDetails && err.details) {
     process.stderr.write('[socialseal] Use --verbose to see error details.\n');
   }
@@ -336,6 +444,7 @@ async function handleAgentRun(opts) {
   const agentUrl = resolveLegacyUrl(resolveAgentUrl(opts, config), 'SOCIALSEAL_AGENT_URL');
   const { resolvedApiBase, legacyUrl } = resolveApiTarget({ apiBase, legacyUrl: agentUrl });
   const timeoutMs = resolveTimeoutMs(opts, config);
+  const idleTimeoutMs = resolveAgentIdleTimeoutMs(opts, config, timeoutMs);
 
   const headers = {
     'Content-Type': 'application/json',
@@ -361,6 +470,8 @@ async function handleAgentRun(opts) {
   }
 
   const sessionData = await sessionRes.json();
+  const sessionId = sessionData?.data?.sessionId || null;
+  const initialConversationId = sessionData?.data?.activeConversationId || opts.conversationId || null;
   const wsUrl = sessionData?.data?.websocketUrl;
   if (!wsUrl) {
     throw new CliError('Missing websocketUrl in session response.', {
@@ -368,6 +479,10 @@ async function handleAgentRun(opts) {
       exitCode: EXIT_CODES.SERVER,
     });
   }
+  emitInfo(
+    opts,
+    `Agent session created${sessionId ? ` (session ${sessionId})` : ''}${initialConversationId ? ` for conversation ${initialConversationId}` : ''}.`,
+  );
 
   const context = parseJsonInput(opts.context, { label: 'context', allowString: true });
   const message = opts.message;
@@ -375,10 +490,36 @@ async function handleAgentRun(opts) {
   await new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
     let finished = false;
+    let settled = false;
     let inactivityTimer = null;
+    let sawAssistantChunk = false;
+    let sawToolCall = false;
+    let sawThinking = false;
+    let lastMessageType = 'none';
+    let activeConversationId = initialConversationId;
+    const toolProgressStatus = new Map();
+
+    const settleResolve = () => {
+      if (settled) return;
+      settled = true;
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      resolve();
+    };
+
+    const settleReject = (error) => {
+      if (settled) return;
+      settled = true;
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      try {
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+      reject(error);
+    };
 
     const resetInactivity = () => {
-      if (!timeoutMs) return;
+      if (!idleTimeoutMs) return;
       if (inactivityTimer) clearTimeout(inactivityTimer);
       inactivityTimer = setTimeout(() => {
         try {
@@ -386,38 +527,74 @@ async function handleAgentRun(opts) {
         } catch {
           // ignore
         }
-        reject(new CliError('WebSocket timed out waiting for agent response.', {
+        settleReject(new CliError('WebSocket timed out waiting for agent response.', {
           code: 'WEBSOCKET_TIMEOUT',
           exitCode: EXIT_CODES.SERVER,
-          hint: 'Increase the timeout with --timeout <ms>.',
+          hint: 'Increase the timeout with --idle-timeout <ms> or --timeout <ms>.',
+          details: truncateDetails({
+            sessionId,
+            activeConversationId,
+            lastMessageType,
+            sawAssistantChunk,
+            sawToolCall,
+            sawThinking,
+            idleTimeoutMs,
+          }),
         }));
-      }, timeoutMs);
+      }, idleTimeoutMs);
     };
 
     ws.on('open', () => {
       resetInactivity();
+      emitInfo(opts, 'Connected to agent WebSocket.');
       const payload = {
         type: 'user_message',
         payload: { content: message, context: context || undefined },
         timestamp: Date.now(),
       };
       ws.send(JSON.stringify(payload));
+      emitInfo(opts, 'User message sent to agent.');
     });
 
     ws.on('message', (data) => {
       try {
         resetInactivity();
         const msg = JSON.parse(data.toString());
+        lastMessageType = msg.type || 'unknown';
+
+        if (msg.type === 'session_state' && msg.payload?.activeConversationId) {
+          activeConversationId = msg.payload.activeConversationId;
+          emitInfo(
+            opts,
+            `Session state received${sessionId ? ` for session ${sessionId}` : ''}${activeConversationId ? ` (conversation ${activeConversationId})` : ''}.`,
+          );
+        }
+
         if (opts.json) {
           process.stdout.write(JSON.stringify(msg) + '\n');
           if (msg.type === 'assistant_chunk' && msg.payload?.done) {
             finished = true;
             ws.close(1000, 'done');
           }
+          if (msg.type === 'error') {
+            const payload = msg.payload || {};
+            settleReject(new CliError(`Agent error: ${payload.message || 'unknown'}`, {
+              code: payload.code || 'AGENT_ERROR',
+              exitCode: EXIT_CODES.SERVER,
+              hint: payload.retryable ? 'Retry the request or inspect backend status.' : null,
+              details: truncateDetails({
+                ...payload,
+                sessionId,
+                activeConversationId,
+                lastMessageType,
+              }),
+            }));
+          }
           return;
         }
         if (msg.type === 'assistant_chunk') {
           const chunk = msg.payload?.chunk ?? '';
+          sawAssistantChunk = sawAssistantChunk || chunk.length > 0 || !!msg.payload?.done;
           if (chunk) process.stdout.write(chunk);
           if (msg.payload?.done) {
             finished = true;
@@ -425,28 +602,114 @@ async function handleAgentRun(opts) {
             ws.close(1000, 'done');
           }
         } else if (msg.type === 'error') {
-          process.stderr.write(`\n[socialseal] Agent error: ${msg.payload?.message || 'unknown'}\n`);
+          const payload = msg.payload || {};
+          settleReject(new CliError(`Agent error: ${payload.message || 'unknown'}`, {
+            code: payload.code || 'AGENT_ERROR',
+            exitCode: EXIT_CODES.SERVER,
+            hint: payload.retryable ? 'Retry the request or inspect backend status.' : null,
+            details: truncateDetails({
+              ...payload,
+              sessionId,
+              activeConversationId,
+              lastMessageType,
+            }),
+          }));
+        } else if (msg.type === 'thinking_chunk') {
+          sawThinking = true;
+          emitInfo(opts, 'Agent is thinking.');
+        } else if (msg.type === 'assistant_status') {
+          const code = msg.payload?.code || 'unknown';
+          const statusMessage = msg.payload?.message || 'Agent reported a status update.';
+          emitInfo(opts, `Agent status [${code}]: ${statusMessage}`);
+        } else if (msg.type === 'tool_call_start') {
+          sawToolCall = true;
+          emitInfo(opts, `Tool start: ${msg.payload?.name || 'unknown'}`);
+        } else if (msg.type === 'tool_call_progress') {
+          const toolCallId = msg.payload?.toolCallId || '';
+          const progressStatus = msg.payload?.status || 'running';
+          if (toolProgressStatus.get(toolCallId) !== progressStatus) {
+            toolProgressStatus.set(toolCallId, progressStatus);
+            emitInfo(opts, `Tool progress: ${progressStatus}`);
+          }
+        } else if (msg.type === 'tool_call_complete') {
+          const error = msg.payload?.error;
+          const duration = typeof msg.payload?.duration_ms === 'number'
+            ? `${msg.payload.duration_ms}ms`
+            : 'unknown duration';
+          if (error) {
+            emitInfo(opts, `Tool failed after ${duration}: ${error}`);
+          } else {
+            emitInfo(opts, `Tool completed in ${duration}.`);
+          }
         }
       } catch (err) {
-        process.stderr.write(`\n[socialseal] Failed to parse agent message: ${err.message || err}\n`);
+        settleReject(new CliError(`Failed to parse agent message: ${err.message || err}`, {
+          code: 'INVALID_AGENT_MESSAGE',
+          exitCode: EXIT_CODES.SERVER,
+          details: data.toString(),
+        }));
       }
     });
 
-    ws.on('close', () => {
-      if (inactivityTimer) clearTimeout(inactivityTimer);
+    ws.on('unexpected-response', async (_req, response) => {
+      const statusText = response.statusCode
+        ? `${response.statusCode}${response.statusMessage ? ` ${response.statusMessage}` : ''}`
+        : 'unknown';
+      const details = await readNodeResponseBody(response);
+      settleReject(new CliError(`WebSocket upgrade failed: ${statusText}`.trim(), {
+        code: 'WEBSOCKET_UPGRADE_FAILED',
+        exitCode:
+          response.statusCode === 401 || response.statusCode === 403
+            ? EXIT_CODES.AUTH
+            : EXIT_CODES.SERVER,
+        hint:
+          response.statusCode === 401 || response.statusCode === 403
+            ? 'Check your CLI key, workspace scope, and session endpoint auth.'
+            : 'Retry with --verbose to inspect gateway or backend behavior.',
+        details: truncateDetails({
+          sessionId,
+          activeConversationId,
+          responseBody: details,
+        }),
+      }));
+    });
+
+    ws.on('close', (code, reason) => {
+      const closeReason = formatCloseReason(reason);
       if (!finished) {
-        reject(new CliError('WebSocket closed before completion.', {
-          code: 'WEBSOCKET_CLOSED',
-          exitCode: EXIT_CODES.SERVER,
-        }));
+        settleReject(new CliError(
+          `WebSocket closed before completion (code ${code}${closeReason ? `: ${closeReason}` : ''}).`,
+          {
+            code: 'WEBSOCKET_CLOSED',
+            exitCode: EXIT_CODES.SERVER,
+            hint: sawAssistantChunk
+              ? 'The agent disconnected mid-response. Retry the request.'
+              : 'The agent closed the connection before completing. Retry with --verbose for more diagnostics.',
+            details: truncateDetails({
+              sessionId,
+              activeConversationId,
+              lastMessageType,
+              sawAssistantChunk,
+              sawToolCall,
+              sawThinking,
+            }),
+          },
+        ));
       } else {
-        resolve();
+        settleResolve();
       }
     });
 
     ws.on('error', (err) => {
-      if (inactivityTimer) clearTimeout(inactivityTimer);
-      reject(err);
+      settleReject(new CliError(`WebSocket error: ${err.message || err}`, {
+        code: 'WEBSOCKET_ERROR',
+        exitCode: EXIT_CODES.SERVER,
+        details: truncateDetails({
+          sessionId,
+          activeConversationId,
+          lastMessageType,
+        }),
+      }));
     });
   });
 }
@@ -492,8 +755,9 @@ async function handleToolsCall(opts) {
 
 function handleToolsList(opts) {
   const payload = {
+    discovery: 'built_in_registry',
     tools: KNOWN_TOOLS,
-    note: 'Tool discovery is disabled in the OSS CLI. Refer to official docs for supported tool names.',
+    note: 'This registry is shipped with the CLI for stable discovery. It is not live backend enumeration.',
   };
 
   if (opts.json) {
@@ -501,8 +765,19 @@ function handleToolsList(opts) {
     return;
   }
 
-  process.stdout.write('[socialseal] Tool discovery is disabled in the OSS CLI.\n');
+  process.stdout.write('[socialseal] Built-in tool registry\n');
   process.stdout.write(`[socialseal] ${payload.note}\n`);
+
+  let currentCategory = null;
+  for (const tool of KNOWN_TOOLS) {
+    if (tool.category !== currentCategory) {
+      currentCategory = tool.category;
+      process.stdout.write(`\n${currentCategory}\n`);
+    }
+    process.stdout.write(`- ${tool.name}: ${tool.description}\n`);
+  }
+
+  process.stdout.write('\n[socialseal] Call a tool with: socialseal tools call --function <name> --body @payload.json\n');
 }
 
 async function handleDataExportTracking(opts) {
@@ -538,6 +813,13 @@ async function handleDataExportTracking(opts) {
 
   if (!res.ok) {
     throw await buildHttpError(res, { label: 'Tracking export' });
+  }
+
+  if (!res.body) {
+    throw new CliError('Export response contained no body.', {
+      code: 'EMPTY_RESPONSE',
+      exitCode: EXIT_CODES.SERVER,
+    });
   }
 
   const outPath = opts.stdout ? null : (opts.out || 'tracking_export.csv');
@@ -615,7 +897,7 @@ const program = new Command();
 program
   .name('socialseal')
   .description('SocialSeal CLI (non-interactive)')
-  .version('0.1.0');
+  .version('0.1.1');
 
 if (typeof program.showHelpAfterError === 'function') {
   program.showHelpAfterError(true);
@@ -638,6 +920,7 @@ program
   .option('--create-new', 'Create a new conversation')
   .option('--json', 'Emit NDJSON events')
   .option('--timeout <ms>', 'Request timeout in milliseconds')
+  .option('--idle-timeout <ms>', 'WebSocket inactivity timeout in milliseconds')
   .option('--verbose', 'Show error details')
   .action((opts) => runCommand(handleAgentRun, opts));
 
@@ -645,7 +928,7 @@ const tools = program.command('tools').description('Call edge functions directly
 
 tools
   .command('list')
-  .description('List tools (discovery disabled in OSS build)')
+  .description('List built-in tool registry entries')
   .option('--json', 'Emit machine-readable output')
   .option('--pretty', 'Pretty-print JSON')
   .option('--verbose', 'Show error details')
