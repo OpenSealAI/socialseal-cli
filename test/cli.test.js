@@ -31,12 +31,15 @@ function createTempConfig(initialConfig = {}) {
   return configPath;
 }
 
+const isolatedConfigPath = createTempConfig({});
+
 function runCli(args, options = {}) {
   return spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf8",
     env: {
       ...process.env,
       EXPLORE_FEATURE_POLICY: JSON.stringify({ mode: "live", allowedChannels: ["cli"] }),
+      SOCIALSEAL_CONFIG: isolatedConfigPath,
       ...options.env,
     },
     timeout: options.timeout ?? 8000,
@@ -49,6 +52,7 @@ function runCliAsync(args, options = {}) {
       env: {
         ...process.env,
         EXPLORE_FEATURE_POLICY: JSON.stringify({ mode: "live", allowedChannels: ["cli"] }),
+        SOCIALSEAL_CONFIG: isolatedConfigPath,
         ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -4253,13 +4257,27 @@ test("Explore CLI rejects empty, excluded-only, and contradictory selections bef
   const cases = [
     { items: [], message: /included item/i },
     {
-      items: [{ itemKind: "search_term", targetId: "44444444-4444-4444-8444-444444444444", inclusionState: "excluded" }],
+      items: [
+        {
+          itemKind: "search_term",
+          targetId: "44444444-4444-4444-8444-444444444444",
+          inclusionState: "excluded",
+        },
+      ],
       message: /included item/i,
     },
     {
       items: [
-        { itemKind: "search_term", targetId: "44444444-4444-4444-8444-444444444444", inclusionState: "included" },
-        { itemKind: "search_term", targetId: "44444444-4444-4444-8444-444444444444", inclusionState: "excluded" },
+        {
+          itemKind: "search_term",
+          targetId: "44444444-4444-4444-8444-444444444444",
+          inclusionState: "included",
+        },
+        {
+          itemKind: "search_term",
+          targetId: "44444444-4444-4444-8444-444444444444",
+          inclusionState: "excluded",
+        },
       ],
       message: /identit/i,
     },
