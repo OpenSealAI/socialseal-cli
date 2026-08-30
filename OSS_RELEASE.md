@@ -2,7 +2,7 @@
 
 ## Pre-release
 - Confirm public base domain (`https://api.socialseal.co`) resolves and routes to the CLI gateway.
-- Validate CLI smoke against production (agent run, tools call).
+- Validate CLI smoke against production (tools call).
 - Run `npm test`.
 - Update `CHANGELOG.md`.
 - Bump version in `package.json`.

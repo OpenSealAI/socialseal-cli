@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import {
+  evaluateExploreFeaturePolicy,
+  EXPLORE_CHANNEL_ACTIONS,
+  EXPLORE_HANDOFF_DESTINATIONS,
+  EXPLORE_MAX_OVERVIEW_LIMIT,
+  EXPLORE_MAX_PAGE_SIZE,
+} from './explore-contracts.js';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +16,7 @@ import WebSocket from 'ws';
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config', 'socialseal', 'config.json');
 const DEFAULT_API_BASE = 'https://api.socialseal.co';
+const DEFAULT_WEB_BASE = 'https://app.socialseal.co';
 const CLI_KEY_HEADER = 'X-CLI-Key';
 const WORKSPACE_HEADER = 'X-Workspace-Id';
 const DEFAULT_TIMEOUT_MS = 300000;
@@ -16,6 +25,22 @@ const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_STATUS_RESULTS_LIMIT = 10;
 const DEFAULT_FRAME_COUNT = 3;
 const MAX_TIMEOUT_MS = 900000;
+const EXPLORE_REQUIRED_FIELDS_BY_ACTION = Object.fromEntries(
+  Object.values(EXPLORE_CHANNEL_ACTIONS)
+    .filter(({ action }) => action !== 'resource_read')
+    .map(({ action, required }) => [action, required]),
+);
+const EXPLORE_WRITE_ACTIONS = new Set(
+  Object.values(EXPLORE_CHANNEL_ACTIONS).filter(({ mutation }) => mutation).map(({ action }) => action),
+);
+const EXPLORE_ACTION_ALIASES = [
+  'lineage',
+  'snapshot',
+  'runStatus',
+  'selection',
+  'compareSnapshots',
+  ...Object.values(EXPLORE_CHANNEL_ACTIONS).map(({ action }) => action).filter((action) => action !== 'resource_read'),
+];
 const LEGACY_ENABLED = process.env.SOCIALSEAL_ENABLE_LEGACY === '1';
 const CLI_VERSION = loadRuntimeVersion();
 const STATIC_TOOL_REGISTRY_NOTE = 'This registry is shipped with the CLI for stable discovery. It is not live backend enumeration, so environment-specific availability can drift.';
@@ -27,10 +52,11 @@ const EXIT_CODES = {
   AUTH: 3,
   NOT_FOUND: 4,
   SERVER: 5,
+  LEGACY_RETIRED: 10,
 };
 const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const ACTIVE_STATUS_VALUES = new Set(['queued', 'pending', 'processing', 'in_progress', 'running']);
-const TOOL_STATUS_KINDS = new Set(['auto', 'agent_job', 'google_ai_run', 'journey_run']);
+const TOOL_STATUS_KINDS = new Set(['auto', 'agent_job', 'google_ai_run', 'journey_run', 'explore_run']);
 const REPORT_TYPE_SEARCH_RESULTS_ENRICHED = 'search_results_enriched';
 const EXPORT_DATA_TEMPLATE_TRACKING_RANKED_VIDEOS_RAW = 'tracking_ranked_videos_raw';
 const EXPORT_DATA_TEMPLATE_GOOGLE_AI_SEARCH_SUMMARIES_RAW = 'google_ai_search_summaries_raw';
@@ -55,10 +81,10 @@ const EXPORT_OPTIONS = [
   {
     id: 'search_results_enriched',
     command: 'socialseal data export-search-results --group-ids <id,id,...>',
-    summary: 'Enriched ranked search rows (search results + video + latest metrics + analysis).',
+    summary: 'Enriched ranked search rows (search capture + video publish/observed dates + latest metrics + scoped resurfacing history + analysis).',
     formats: ['csv'],
     required: ['workspace id', '--group-ids'],
-    bestFor: 'SQL-like ranked-search datasets without using psql.',
+    bestFor: 'SQL-like ranked-search datasets and deck evidence that must distinguish capture, metrics, publish, and tracked-search resurfacing timestamps.',
     alias: 'socialseal data export-report --report-type search_results_enriched --format csv --payload @payload.json',
   },
   {
@@ -95,6 +121,17 @@ const KNOWN_TOOLS = [
   { name: 'workspace-notes', category: 'agent', description: 'Search, create, update, and pin workspace note memory.' },
   { name: 'workspace-onboarding', category: 'agent', description: 'Read or update workspace onboarding metadata used by the agent.' },
   {
+    name: 'retirement',
+    category: 'discovery',
+    description: 'Read runtime legacy-capability retirement metadata: deprecating, retired, and quarantined surfaces with replacements, promised browser redirects, and active monitoring windows.',
+    objectType: 'retirement_ledger',
+    transport: 'post_edge_function',
+    workspaceScoped: false,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['list', 'resolve'],
+    notes: 'Read-only. Ledger mutations require internal credentials.',
+  },
+  {
     name: 'brand-group-management',
     category: 'brand',
     description: 'Manage brand groups, aliases, competitors, and rule configuration.',
@@ -124,7 +161,7 @@ const KNOWN_TOOLS = [
     transport: 'post_edge_function',
     workspaceScoped: true,
     knownLocalDevState: 'disabled_by_default',
-    notes: 'Includes template `tracking_ranked_videos_raw` for ranked search results with video + metrics + analysis enrichment.',
+    notes: 'Includes template `tracking_ranked_videos_raw` for ranked search results with video publish/observed dates, latest metrics, scoped first/last seen, and analysis enrichment.',
   },
   {
     name: 'export_tracking_data',
@@ -134,6 +171,7 @@ const KNOWN_TOOLS = [
     transport: 'post_edge_function',
     workspaceScoped: true,
     knownLocalDevState: 'disabled_by_default',
+    replacement: 'export-report (reportType search_results_enriched)',
     notes: 'group_id expects a numeric tracking_group id, not a brand_group UUID. Always pass a workspace id or configure a default workspace so the export does not silently target the personal workspace.',
   },
   {
@@ -144,7 +182,95 @@ const KNOWN_TOOLS = [
     transport: 'post_edge_function',
     workspaceScoped: true,
     knownLocalDevState: 'enabled',
-    notes: 'Accepts videoId/videoUid/platformVideoId/searchResultId items; videoId means video_uid or platform-native video id, not a tracking item id.',
+    notes: 'Accepts videoId/videoUid/platformVideoId/searchResultId items and public URL items with allowUntracked=true; videoId means video_uid or platform-native video id, not a tracking item id.',
+  },
+  {
+    name: 'vnext-clips-read',
+    category: 'asset-studio',
+    description: 'List workspace clip-library items and optionally sign selected source videos.',
+    objectType: 'workspace_clip',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
+  {
+    name: 'vnext-clips-create',
+    category: 'asset-studio',
+    description: 'Create signed clip upload targets and finalize uploaded clip metadata.',
+    objectType: 'workspace_clip',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['create', 'finalize'],
+    notes: 'The create action returns signed upload URLs; upload bytes to storage before calling finalize.',
+  },
+  {
+    name: 'vnext-clip-shot-mappings-read',
+    category: 'asset-studio',
+    description: 'Read clip-to-blueprint shot mappings for Asset Studio.',
+    objectType: 'clip_shot_mapping',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
+  {
+    name: 'vnext-clip-shot-mappings-write',
+    category: 'asset-studio',
+    description: 'Upsert or delete clip-to-blueprint shot mappings for Asset Studio.',
+    objectType: 'clip_shot_mapping',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['upsert', 'delete'],
+  },
+  {
+    name: 'vnext-generated-assets-read',
+    category: 'asset-studio',
+    description: 'List generated rough cuts for a blueprint or read one generated asset.',
+    objectType: 'generated_asset',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['list', 'detail'],
+  },
+  {
+    name: 'vnext-generated-asset-create',
+    category: 'asset-studio',
+    description: 'Create a generated rough-cut asset from an edit spec.',
+    objectType: 'generated_asset',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
+  {
+    name: 'vnext-generated-asset-optimize',
+    category: 'asset-studio',
+    description: 'Optimize a generated asset or create a new revision.',
+    objectType: 'generated_asset_revision',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['optimize', 'create-revision'],
+  },
+  {
+    name: 'vnext-generated-asset-export',
+    category: 'asset-studio',
+    description: 'Export a generated rough cut as FCPXML.',
+    objectType: 'generated_asset_export',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
+  {
+    name: 'vnext-generated-asset-share',
+    category: 'asset-studio',
+    description: 'Create, read, or revoke generated-asset share links.',
+    objectType: 'generated_asset_share',
+    transport: 'post_edge_function',
+    workspaceScoped: false,
+    knownLocalDevState: 'enabled',
+    actionAliases: ['create', 'read', 'revoke'],
+    notes: 'create/revoke require workspaceId in the body; read uses shareToken and does not require workspace scope.',
   },
   { name: 'douyin-geo-api', category: 'search', description: 'Query Douyin search and geo data.' },
   {
@@ -215,10 +341,48 @@ const KNOWN_TOOLS = [
     knownLocalDevState: 'enabled',
     notes: 'Async start returns runId; poll with action=status or socialseal tools status <runId> --kind journey_run --workspace-id <workspace-id>.',
   },
+  {
+    name: 'explore-api',
+    category: 'explore',
+    description: 'Read and advance the canonical Explore demand workflow.',
+    objectType: 'explore_run',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+    actionAliases: EXPLORE_ACTION_ALIASES,
+    notes: 'Reads preserve canonical source/evidence refs and typed partial/unavailable states. Writes require an explicit workspace and never widen a selection; poll async runs with tools status --kind explore_run.',
+  },
   { name: 'vnext-blueprints-create', category: 'vnext', description: 'Create a vNext blueprint from grounded evidence.' },
   { name: 'vnext-blueprints-generate', category: 'vnext', description: 'Generate a vNext blueprint from workspace opportunity data.' },
   { name: 'vnext-blueprints-read', category: 'vnext', description: 'Read vNext blueprint history and specific versions.' },
+  {
+    name: 'vnext-blueprints-shots-read',
+    category: 'video-production',
+    description: 'Read shot-lift and pinned shot assets for a blueprint.',
+    objectType: 'blueprint_shot_asset',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
+  {
+    name: 'vnext-blueprints-shots-refresh',
+    category: 'video-production',
+    description: 'Queue a refresh for blueprint shot assets.',
+    objectType: 'blueprint_shots_job',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
   { name: 'vnext-briefs-create', category: 'vnext', description: 'Create a vNext brief record.' },
+  {
+    name: 'vnext-briefs-export',
+    category: 'video-production',
+    description: 'Export a generated vNext brief as markdown.',
+    objectType: 'vnext_brief_export',
+    transport: 'post_edge_function',
+    workspaceScoped: true,
+    knownLocalDevState: 'enabled',
+  },
   { name: 'vnext-briefs-generate', category: 'vnext', description: 'Generate a vNext brief from a blueprint or opportunity.' },
   { name: 'vnext-briefs-read', category: 'vnext', description: 'Read generated vNext briefs and version history.' },
   { name: 'vnext-intents', category: 'vnext', description: 'List, create, update, or delete vNext intents.' },
@@ -231,6 +395,27 @@ const KNOWN_TOOLS = [
 ];
 
 const TOOL_SCHEMA_HINTS = {
+  retirement: {
+    summary: 'Read the legacy-capability retirement ledger: notices, promised browser redirects, and active monitoring windows.',
+    operations: [
+      {
+        action: 'list',
+        required: ['action=list'],
+        optional: [],
+        example: { action: 'list' },
+      },
+      {
+        action: 'resolve',
+        required: ['action=resolve', 'identifier'],
+        optional: [],
+        example: { action: 'resolve', identifier: 'edge_function:export_tracking_data' },
+      },
+    ],
+    cliExamples: [
+      "socialseal tools call --function retirement --body '{\"action\":\"list\"}'",
+      "socialseal tools call --function retirement --body '{\"action\":\"resolve\",\"identifier\":\"edge_function:export_tracking_data\"}'",
+    ],
+  },
   'agent-tool-jobs': {
     summary: 'Queue agent-backed jobs and read UUID job status.',
     operations: [
@@ -256,6 +441,23 @@ const TOOL_SCHEMA_HINTS = {
         example: {
           action: 'status',
           jobId: '11111111-1111-4111-8111-111111111111',
+        },
+      },
+      {
+        action: 'status',
+        required: ['action=status', 'workspaceId or --workspace-id', 'items[] with videoUid or platformVideoId'],
+        optional: ['includeRawAnalysis'],
+        notes: 'Status polling is read-only and does not accept URL items; use videoUid or platformVideoId returned by the initial URL extraction response.',
+        example: {
+          action: 'status',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          items: [
+            {
+              videoUid: '11111111-1111-4111-8111-111111111111',
+            },
+          ],
+          includeAssets: false,
+          includeSourceVideo: false,
         },
       },
     ],
@@ -305,6 +507,96 @@ const TOOL_SCHEMA_HINTS = {
     cliExamples: [
       'socialseal tools call --function search-journey-run --body @journey.json --async --workspace-id <workspace-uuid>',
       'socialseal tools status 11111111-1111-4111-8111-111111111111 --kind journey_run --workspace-id <workspace-uuid>',
+    ],
+  },
+  'explore-api': {
+    summary: 'Read and advance the canonical Explore demand workflow with exact evidence and workspace context.',
+    operations: [
+      {
+        action: 'workspaceOverview',
+        required: ['workspaceId'],
+        optional: ['limit', 'page', 'pageSize', 'sort', 'outcome'],
+        example: { action: 'workspaceOverview', workspaceId: '<workspace-uuid>', limit: 20 },
+      },
+      {
+        action: 'startLineage',
+        required: ['workspaceId', 'anchor', 'marketCode', 'languageTag', 'previewFingerprint', 'idempotencyKey'],
+        optional: ['sourceKind', 'sourceRef', 'intentFingerprint', 'providerBasket', 'evidenceWindow'],
+        example: { action: 'startLineage', workspaceId: '<workspace-uuid>', anchor: { anchorKind: 'search_term', subjectId: '<subject-uuid>' }, marketCode: 'SG', languageTag: 'en', previewFingerprint: '<server-issued-preview>', idempotencyKey: 'explore-start-1' },
+      },
+      {
+        action: 'lineage',
+        required: ['workspaceId', 'lineageId'],
+        optional: ['page', 'pageSize', 'sort', 'outcome'],
+        example: { action: 'lineage', workspaceId: '<workspace-uuid>', lineageId: '<lineage-uuid>' },
+      },
+      {
+        action: 'snapshot',
+        required: ['workspaceId', 'snapshotId'],
+        optional: ['page', 'pageSize', 'sort', 'outcome'],
+        example: { action: 'snapshot', workspaceId: '<workspace-uuid>', snapshotId: '<snapshot-uuid>' },
+      },
+      {
+        action: 'runStatus',
+        required: ['workspaceId', 'runId'],
+        optional: [],
+        example: { action: 'runStatus', workspaceId: '<workspace-uuid>', runId: '<run-uuid>' },
+      },
+      {
+        action: 'refreshLineage',
+        required: ['workspaceId', 'lineageId', 'idempotencyKey'],
+        optional: ['providerBasket', 'evidenceWindow'],
+        example: { action: 'refreshLineage', workspaceId: '<workspace-uuid>', lineageId: '<lineage-uuid>', idempotencyKey: 'explore-refresh-1' },
+      },
+      {
+        action: 'createSelection',
+        required: ['workspaceId', 'lineageId', 'snapshotId', 'interpretationRevisionId', 'intendedDestination', 'intendedUse', 'items', 'idempotencyKey'],
+        optional: ['userQuestion', 'continuationMetadata'],
+        example: { action: 'createSelection', workspaceId: '<workspace-uuid>', lineageId: '<lineage-uuid>', snapshotId: '<snapshot-uuid>', interpretationRevisionId: '<revision-uuid>', intendedDestination: 'monitor', intendedUse: 'focused demand monitoring', items: [{ itemKind: 'search_term', targetId: '<search-term-uuid>', inclusionState: 'included' }], idempotencyKey: 'explore-selection-1' },
+      },
+      {
+        action: 'applyInterpretationCorrection',
+        required: ['workspaceId', 'lineageId', 'snapshotId', 'expectedRevisionId', 'labels', 'memberships', 'idempotencyKey'],
+        optional: ['operation', 'selectedCandidateTopicId', 'targetCandidateTopicId', 'targetMemberships', 'newCandidateTopic', 'status', 'changeSummary'],
+        example: { action: 'applyInterpretationCorrection', workspaceId: '<workspace-uuid>', lineageId: '<lineage-uuid>', snapshotId: '<snapshot-uuid>', expectedRevisionId: '<revision-uuid>', labels: [], memberships: [], idempotencyKey: 'explore-correction-1' },
+      },
+      {
+        action: 'activationPreview',
+        required: ['workspaceId', 'selectionId'],
+        optional: ['bindings', 'targetMonitorId', 'expectedScopeVersionId', 'focalBrandId', 'monitorName', 'topicMappings'],
+        example: { action: 'activationPreview', workspaceId: '<workspace-uuid>', selectionId: '<selection-uuid>' },
+      },
+      {
+        action: 'activateSearches',
+        required: ['workspaceId', 'selectionId', 'planFingerprint', 'bindings', 'idempotencyKey'],
+        optional: ['targetMonitorId', 'expectedScopeVersionId', 'focalBrandId', 'monitorName', 'topicMappings', 'canonicalInputHash'],
+        example: { action: 'activateSearches', workspaceId: '<workspace-uuid>', selectionId: '<selection-uuid>', planFingerprint: '<server-issued-plan>', bindings: [{ subjectId: '<search-term-uuid>', topicIds: [], schedules: [] }], idempotencyKey: 'explore-activation-1' },
+      },
+      {
+        action: 'prepareHandoff',
+        required: ['workspaceId', 'selectionId', 'destination', 'idempotencyKey'],
+        optional: [],
+        example: { action: 'prepareHandoff', workspaceId: '<workspace-uuid>', selectionId: '<selection-uuid>', destination: 'monitor', idempotencyKey: 'explore-handoff-1' },
+      },
+      {
+        action: 'createDeliverable',
+        required: ['workspaceId', 'selectionId', 'idempotencyKey'],
+        optional: [],
+        example: { action: 'createDeliverable', workspaceId: '<workspace-uuid>', selectionId: '<selection-uuid>', idempotencyKey: 'explore-deliverable-1' },
+      },
+    ],
+    cliExamples: [
+      'socialseal explore list --workspace-id <workspace-uuid>',
+      'socialseal explore start --workspace-id <workspace-uuid> --body @start.json',
+      'socialseal explore get --workspace-id <workspace-uuid> --resource snapshot --snapshot-id <snapshot-uuid>',
+      'socialseal explore refresh --workspace-id <workspace-uuid> --body @refresh.json',
+      'socialseal explore correct --workspace-id <workspace-uuid> --body @correction.json',
+      'socialseal explore select --workspace-id <workspace-uuid> --body @selection.json',
+      'socialseal explore preview-activation --workspace-id <workspace-uuid> --selection-id <selection-uuid>',
+      'socialseal explore activate --workspace-id <workspace-uuid> --body @activation.json',
+      'socialseal explore handoff --workspace-id <workspace-uuid> --body @handoff.json',
+      'socialseal explore deliverable --workspace-id <workspace-uuid> --selection-id <selection-uuid> --idempotency-key <key>',
+      'socialseal tools status <run-uuid> --kind explore_run --workspace-id <workspace-uuid>',
     ],
   },
   'google-ai-search': {
@@ -376,6 +668,369 @@ const TOOL_SCHEMA_HINTS = {
       'socialseal tools call --function get-google-ai-search-results --body \'{"runId":6809,"includeCitations":true,"limit":10}\'',
     ],
   },
+  'tracked-video-extract': {
+    summary: 'Extract assets and queue/read analysis for tracked identifiers or ad hoc public video URLs.',
+    operations: [
+      {
+        action: 'extract',
+        required: ['workspaceId or --workspace-id', 'items[] with exactly one selector'],
+        optional: [
+          'items[].searchResultId',
+          'items[].videoId',
+          'items[].videoUid',
+          'items[].platformVideoId',
+          'items[].url',
+          'allowUntracked',
+          'ensureAnalysis',
+          'includeAssets',
+          'includeSourceVideo',
+          'frameStrategy',
+          'frameCount',
+          'signedUrlSeconds',
+        ],
+        notes: 'URL items require request-level allowUntracked:true. Supported selectors are url, searchResultId, videoId, videoUid, or platformVideoId.',
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          allowUntracked: true,
+          ensureAnalysis: true,
+          items: [
+            {
+              url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+            },
+          ],
+        },
+      },
+      {
+        action: 'queue-analysis',
+        required: ['workspaceId or --workspace-id', 'items[] with exactly one selector'],
+        optional: ['allowUntracked for URL items', 'queueOnly', 'includeRawAnalysis'],
+        notes: 'Set ensureAnalysis:true and queueOnly:true to enqueue analysis without asset URL generation.',
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          allowUntracked: true,
+          ensureAnalysis: true,
+          queueOnly: true,
+          includeAssets: false,
+          items: [
+            {
+              url: 'https://www.tiktok.com/@creator/video/7348293840000000000',
+            },
+          ],
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal video extract --url https://www.youtube.com/watch?v=dQw4w9WgXcQ --allow-untracked --wait --out-dir ./video-assets --workspace-id <workspace-uuid>',
+      'socialseal video queue-analysis --url https://www.tiktok.com/@creator/video/7348293840000000000 --allow-untracked --wait --workspace-id <workspace-uuid>',
+      'socialseal video extract --video-uid <video-uuid> --wait --workspace-id <workspace-uuid>',
+      'socialseal tools call --function tracked-video-extract --workspace-id <workspace-uuid> --body \'{"allowUntracked":true,"items":[{"url":"https://www.instagram.com/reel/SHORTCODE/"}]}\'',
+    ],
+  },
+  'vnext-clips-read': {
+    summary: 'List Asset Studio clip-library items and optionally sign selected video URLs.',
+    operations: [
+      {
+        action: 'list',
+        required: ['workspaceId or --workspace-id'],
+        optional: ['videoClipIds[] to include signed source video URLs'],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          videoClipIds: ['11111111-1111-4111-8111-111111111111'],
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-clips-read --workspace-id <workspace-uuid> --body \'{"videoClipIds":["<clip-uuid>"]}\'',
+    ],
+  },
+  'vnext-clips-create': {
+    summary: 'Create signed upload targets for clips and finalize uploaded clip metadata.',
+    operations: [
+      {
+        action: 'create',
+        required: ['action=create', 'workspaceId or --workspace-id', 'fileName', 'mimeType'],
+        optional: [],
+        example: {
+          action: 'create',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          fileName: 'hero-shot.mp4',
+          mimeType: 'video/mp4',
+        },
+      },
+      {
+        action: 'finalize',
+        required: ['action=finalize', 'workspaceId or --workspace-id', 'clipId', 'fileName', 'storagePath', 'mimeType', 'sizeBytes', 'rightsAttested=true'],
+        optional: ['durationSeconds', 'width', 'height', 'posterPath'],
+        example: {
+          action: 'finalize',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          clipId: '11111111-1111-4111-8111-111111111111',
+          fileName: 'hero-shot.mp4',
+          storagePath: 'workspace-00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111.mp4',
+          mimeType: 'video/mp4',
+          sizeBytes: 1048576,
+          rightsAttested: true,
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-clips-create --workspace-id <workspace-uuid> --body \'{"action":"create","fileName":"hero-shot.mp4","mimeType":"video/mp4"}\'',
+      'socialseal tools call --function vnext-clips-create --workspace-id <workspace-uuid> --body @clip-finalize.json',
+    ],
+  },
+  'vnext-clip-shot-mappings-read': {
+    summary: 'Read Asset Studio clip-to-shot mappings for a blueprint.',
+    operations: [
+      {
+        action: 'read',
+        required: ['workspaceId or --workspace-id', 'blueprintId'],
+        optional: [],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-clip-shot-mappings-read --workspace-id <workspace-uuid> --body \'{"blueprintId":"<blueprint-uuid>"}\'',
+    ],
+  },
+  'vnext-clip-shot-mappings-write': {
+    summary: 'Upsert or delete Asset Studio clip-to-shot mappings.',
+    operations: [
+      {
+        action: 'upsert',
+        required: ['action=upsert', 'workspaceId or --workspace-id', 'blueprintId', 'panelId', 'clipId'],
+        optional: ['source (suggested|override)', 'score'],
+        example: {
+          action: 'upsert',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+          panelId: 'panel-1',
+          clipId: '11111111-1111-4111-8111-111111111111',
+          source: 'override',
+        },
+      },
+      {
+        action: 'delete',
+        required: ['action=delete', 'workspaceId or --workspace-id', 'blueprintId', 'panelId'],
+        optional: [],
+        example: {
+          action: 'delete',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+          panelId: 'panel-1',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-clip-shot-mappings-write --workspace-id <workspace-uuid> --body \'{"action":"upsert","blueprintId":"<blueprint-uuid>","panelId":"panel-1","clipId":"<clip-uuid>"}\'',
+    ],
+  },
+  'vnext-generated-assets-read': {
+    summary: 'List generated rough cuts for a blueprint or read one generated asset.',
+    operations: [
+      {
+        action: 'list',
+        required: ['action=list', 'workspaceId or --workspace-id', 'blueprintId'],
+        optional: [],
+        example: {
+          action: 'list',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+        },
+      },
+      {
+        action: 'detail',
+        required: ['action=detail', 'workspaceId or --workspace-id', 'assetId'],
+        optional: [],
+        example: {
+          action: 'detail',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          assetId: '33333333-3333-4333-8333-333333333333',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-generated-assets-read --workspace-id <workspace-uuid> --body \'{"action":"list","blueprintId":"<blueprint-uuid>"}\'',
+      'socialseal tools call --function vnext-generated-assets-read --workspace-id <workspace-uuid> --body \'{"action":"detail","assetId":"<asset-uuid>"}\'',
+    ],
+  },
+  'vnext-generated-asset-create': {
+    summary: 'Create a generated rough cut from an Asset Studio edit spec.',
+    operations: [
+      {
+        action: 'create',
+        required: ['workspaceId or --workspace-id', 'blueprintId', 'title', 'editSpec'],
+        optional: [],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+          title: 'Homepage rough cut',
+          editSpec: {
+            version: 1,
+            fps: 30,
+            width: 1080,
+            height: 1920,
+            totalDurationSeconds: 3,
+            shots: [
+              {
+                panelId: 'panel-1',
+                clipId: '11111111-1111-4111-8111-111111111111',
+                title: 'Opening hook',
+                kind: 'hook',
+                shotLabel: 'Hero exterior',
+                sourceStartSeconds: 0,
+                durationSeconds: 3,
+                evidenceIds: [],
+              },
+            ],
+          },
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-generated-asset-create --workspace-id <workspace-uuid> --body @edit-spec.json',
+    ],
+  },
+  'vnext-generated-asset-optimize': {
+    summary: 'Optimize a generated asset or create a new revision.',
+    operations: [
+      {
+        action: 'optimize',
+        required: ['action=optimize', 'workspaceId or --workspace-id', 'assetId'],
+        optional: [],
+        example: {
+          action: 'optimize',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          assetId: '33333333-3333-4333-8333-333333333333',
+        },
+      },
+      {
+        action: 'create-revision',
+        required: ['action=create-revision', 'workspaceId or --workspace-id', 'assetId'],
+        optional: [],
+        example: {
+          action: 'create-revision',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          assetId: '33333333-3333-4333-8333-333333333333',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-generated-asset-optimize --workspace-id <workspace-uuid> --body \'{"action":"optimize","assetId":"<asset-uuid>"}\'',
+    ],
+  },
+  'vnext-generated-asset-export': {
+    summary: 'Export a generated rough cut as FCPXML.',
+    operations: [
+      {
+        action: 'export',
+        required: ['workspaceId or --workspace-id', 'assetId'],
+        optional: ['format=fcpxml'],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          assetId: '33333333-3333-4333-8333-333333333333',
+          format: 'fcpxml',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-generated-asset-export --workspace-id <workspace-uuid> --body \'{"assetId":"<asset-uuid>","format":"fcpxml"}\'',
+    ],
+  },
+  'vnext-generated-asset-share': {
+    summary: 'Create, read, or revoke generated rough-cut share links.',
+    operations: [
+      {
+        action: 'create',
+        required: ['action=create', 'workspaceId', 'assetId'],
+        optional: ['ttlSeconds', 'shareBaseUrl'],
+        example: {
+          action: 'create',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          assetId: '33333333-3333-4333-8333-333333333333',
+          ttlSeconds: 604800,
+        },
+      },
+      {
+        action: 'read',
+        required: ['action=read', 'shareToken'],
+        optional: [],
+        example: {
+          action: 'read',
+          shareToken: '0123456789abcdef0123456789abcdef',
+        },
+      },
+      {
+        action: 'revoke',
+        required: ['action=revoke', 'workspaceId', 'shareLinkId'],
+        optional: [],
+        example: {
+          action: 'revoke',
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          shareLinkId: '44444444-4444-4444-8444-444444444444',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-generated-asset-share --body \'{"action":"create","workspaceId":"<workspace-uuid>","assetId":"<asset-uuid>"}\'',
+      'socialseal tools call --function vnext-generated-asset-share --body \'{"action":"read","shareToken":"<share-token>"}\'',
+    ],
+  },
+  'vnext-blueprints-shots-read': {
+    summary: 'Read blueprint shot-lift rows and pinned shot assets with signed URLs.',
+    operations: [
+      {
+        action: 'read',
+        required: ['workspaceId or --workspace-id', 'blueprintId'],
+        optional: ['signedUrlSeconds'],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+          signedUrlSeconds: 3600,
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-blueprints-shots-read --workspace-id <workspace-uuid> --body \'{"blueprintId":"<blueprint-uuid>"}\'',
+    ],
+  },
+  'vnext-blueprints-shots-refresh': {
+    summary: 'Queue a refresh for blueprint shot assets.',
+    operations: [
+      {
+        action: 'refresh',
+        required: ['workspaceId or --workspace-id', 'blueprintId'],
+        optional: [],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          blueprintId: '22222222-2222-4222-8222-222222222222',
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-blueprints-shots-refresh --workspace-id <workspace-uuid> --body \'{"blueprintId":"<blueprint-uuid>"}\'',
+    ],
+  },
+  'vnext-briefs-export': {
+    summary: 'Export the latest or selected generated vNext brief as markdown.',
+    operations: [
+      {
+        action: 'export',
+        required: ['workspaceId or --workspace-id', 'opportunityKey'],
+        optional: ['version'],
+        example: {
+          workspaceId: '00000000-0000-4000-8000-000000000000',
+          opportunityKey: 'opportunity-key',
+          version: 1,
+        },
+      },
+    ],
+    cliExamples: [
+      'socialseal tools call --function vnext-briefs-export --workspace-id <workspace-uuid> --body \'{"opportunityKey":"<opportunity-key>"}\'',
+    ],
+  },
   'group-management': {
     summary: 'Manage single-platform tracking groups and memberships.',
     operations: [
@@ -445,8 +1100,46 @@ function getToolSchemaHint(functionName) {
   return TOOL_SCHEMA_HINTS[functionName] || null;
 }
 
-function getKnownTool(functionName) {
-  return KNOWN_TOOLS.find((tool) => tool.name === functionName) || null;
+function getKnownTool(functionName, config = loadConfig()) {
+  const tool = KNOWN_TOOLS.find((entry) => entry.name === functionName) || null;
+  return tool?.name === 'explore-api' && !isExploreCliVisible(
+    resolveWorkspaceSelection({}, config).workspaceId,
+    config,
+  )
+    ? null
+    : tool;
+}
+
+function exploreFeaturePolicy(config = loadConfig()) {
+  return process.env.EXPLORE_FEATURE_POLICY ?? config.exploreFeaturePolicy ?? { mode: 'off' };
+}
+
+function exploreCliPolicyDecision(workspaceId = null, config = loadConfig()) {
+  return evaluateExploreFeaturePolicy({
+    policy: exploreFeaturePolicy(config),
+    channel: 'cli',
+    workspaceId,
+  });
+}
+
+function isExploreCliVisible(workspaceId = null, config = loadConfig()) {
+  return exploreCliPolicyDecision(workspaceId, config).allowed;
+}
+
+function isExploreCliRegistered(config = loadConfig()) {
+  const decision = exploreCliPolicyDecision(null, config);
+  return decision.allowed || decision.reason === 'workspace_not_allowlisted';
+}
+
+function requireExploreCliVisibility(workspaceId, config) {
+  const decision = exploreCliPolicyDecision(workspaceId, config);
+  if (decision.allowed) return;
+  throw new CliError('Explore is not released through the CLI for this policy or workspace.', {
+    code: 'EXPLORE_FEATURE_UNAVAILABLE',
+    exitCode: EXIT_CODES.NOT_FOUND,
+    hint: 'Use the app or wait for the Explore release policy to allow the CLI channel.',
+    details: { reason: decision.reason, channel: decision.channel, workspaceId: decision.workspaceId },
+  });
 }
 
 function buildSchemaAvailabilitySummary(schema) {
@@ -458,14 +1151,30 @@ function buildSchemaAvailabilitySummary(schema) {
 }
 
 function buildToolRegistry() {
-  return KNOWN_TOOLS.map((tool) => {
-    const schema = getToolSchemaHint(tool.name);
-    if (!schema) return tool;
-    return {
-      ...tool,
-      schemaAvailable: true,
-      schemaSummary: buildSchemaAvailabilitySummary(schema),
-    };
+  const config = loadConfig();
+  const workspaceId = resolveWorkspaceSelection({}, config).workspaceId;
+  return KNOWN_TOOLS
+    .filter((tool) => tool.name !== 'explore-api' || isExploreCliVisible(workspaceId, config))
+    .map((tool) => {
+      const schema = getToolSchemaHint(tool.name);
+      if (!schema) return tool;
+      return {
+        ...tool,
+        schemaAvailable: true,
+        schemaSummary: buildSchemaAvailabilitySummary(schema),
+      };
+    });
+}
+
+function filterToolRegistry(tools, category) {
+  const normalizedCategory = trimString(category).toLowerCase();
+  const filtered = normalizedCategory
+    ? tools.filter((tool) => trimString(tool.category).toLowerCase() === normalizedCategory)
+    : tools;
+  return [...filtered].sort((a, b) => {
+    const categoryCompare = trimString(a.category).localeCompare(trimString(b.category));
+    if (categoryCompare !== 0) return categoryCompare;
+    return trimString(a.name).localeCompare(trimString(b.name));
   });
 }
 
@@ -511,8 +1220,35 @@ function saveConfig(config) {
     Object.entries(config || {}).filter(([, value]) => value !== undefined),
   );
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, `${JSON.stringify(normalizedConfig, null, 2)}\n`);
+  fs.writeFileSync(configPath, `${JSON.stringify(normalizedConfig, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  fs.chmodSync(configPath, 0o600);
 }
+
+function assertConfigWritable() {
+  const configPath = getConfigPath();
+  const configDir = path.dirname(configPath);
+  fs.mkdirSync(configDir, { recursive: true });
+  const probePath = path.join(configDir, `.socialseal-write-test-${process.pid}-${Date.now()}`);
+  try {
+    fs.writeFileSync(probePath, '', { mode: 0o600 });
+    fs.unlinkSync(probePath);
+  } catch (error) {
+    try {
+      if (fs.existsSync(probePath)) fs.unlinkSync(probePath);
+    } catch {
+      // best effort cleanup only
+    }
+    throw new CliError(`Cannot write SocialSeal config at ${configPath}.`, {
+      code: 'CONFIG_NOT_WRITABLE',
+      exitCode: EXIT_CODES.USAGE,
+      hint: 'Set SOCIALSEAL_CONFIG to a writable path, or set SOCIALSEAL_API_KEY manually.',
+      details: error?.message || String(error),
+    });
+  }
+}
+
 
 function resolveApiKey(opts, config) {
   return opts.apiKey || process.env.SOCIALSEAL_API_KEY || config.apiKey;
@@ -528,6 +1264,10 @@ function resolveAgentUrl(opts, config) {
 
 function resolveSupabaseUrl(opts, config) {
   return opts.supabaseUrl || process.env.SOCIALSEAL_SUPABASE_URL || config.supabaseUrl;
+}
+
+function resolveWebBase(opts = {}, config = {}) {
+  return opts.webBase || process.env.SOCIALSEAL_WEB_BASE || config.webBase || DEFAULT_WEB_BASE;
 }
 
 function resolveWorkspaceSelection(opts, config) {
@@ -751,6 +1491,7 @@ function inferExtension(urlValue, contentType, fallback = '.bin') {
 function normalizeVideoExtractBody(body) {
   const normalized = { ...body };
   const hasInlineIdentifier =
+    normalized.url !== undefined ||
     normalized.videoId !== undefined ||
     normalized.searchResultId !== undefined ||
     normalized.videoUid !== undefined ||
@@ -758,12 +1499,14 @@ function normalizeVideoExtractBody(body) {
 
   if (!Array.isArray(normalized.items) && hasInlineIdentifier) {
     normalized.items = [{
+      url: normalized.url,
       videoId: normalized.videoId,
       searchResultId: normalized.searchResultId,
       videoUid: normalized.videoUid,
       platformVideoId: normalized.platformVideoId,
       platformId: normalized.platformId,
     }];
+    delete normalized.url;
     delete normalized.videoId;
     delete normalized.searchResultId;
     delete normalized.videoUid;
@@ -774,6 +1517,11 @@ function normalizeVideoExtractBody(body) {
   return normalized;
 }
 
+function hasUrlVideoItems(body) {
+  const items = Array.isArray(body?.items) ? body.items : [];
+  return items.some((item) => typeof item?.url === 'string' && item.url.trim().length > 0);
+}
+
 function buildVideoExtractBody(opts, workspaceId) {
   const parsed = opts.body
     ? ensureJsonObject(parseJsonInput(opts.body, { label: 'body' }), 'body')
@@ -782,6 +1530,7 @@ function buildVideoExtractBody(opts, workspaceId) {
 
   if (!Array.isArray(normalized.items) || normalized.items.length === 0) {
     const inlineItem = stripUndefinedEntries({
+      url: trimString(opts.url) || undefined,
       videoId: trimString(opts.videoId) || undefined,
       searchResultId: opts.searchResultId !== undefined
         ? coercePositiveInteger(opts.searchResultId, 'searchResultId')
@@ -791,10 +1540,10 @@ function buildVideoExtractBody(opts, workspaceId) {
     });
 
     if (Object.keys(inlineItem).length === 0) {
-      throw new CliError('Provide --body or one of --video-id, --video-uid, --platform-video-id, or --search-result-id.', {
+      throw new CliError('Provide --body or one of --url, --video-id, --video-uid, --platform-video-id, or --search-result-id.', {
         code: 'MISSING_ARGUMENT',
         exitCode: EXIT_CODES.USAGE,
-        hint: '--video-id accepts a video_uid or platform video id. It does not accept tracking item ids.',
+        hint: '--url requires --allow-untracked. --video-id accepts a video_uid or platform video id; it does not accept tracking item ids.',
       });
     }
 
@@ -811,6 +1560,17 @@ function buildVideoExtractBody(opts, workspaceId) {
   }
 
   const nextBody = { ...bodyWithWorkspace };
+  if (opts.allowUntracked === true) {
+    nextBody.allowUntracked = true;
+  }
+  if (hasUrlVideoItems(nextBody) && nextBody.allowUntracked !== true) {
+    throw new CliError('URL video analysis requires --allow-untracked or allowUntracked:true in --body.', {
+      code: 'ALLOW_UNTRACKED_REQUIRED',
+      exitCode: EXIT_CODES.USAGE,
+      hint: 'Pass --allow-untracked for ad hoc public URL analysis. Existing tracked identifier flows do not need this flag.',
+    });
+  }
+
   if (opts.wait) {
     nextBody.ensureAnalysis = true;
   } else if (opts.ensureAnalysis === true) {
@@ -868,9 +1628,58 @@ function buildVideoQueueBody(opts, workspaceId) {
 function hasPendingVideoExtractResults(payload) {
   const results = Array.isArray(payload?.results) ? payload.results : [];
   return results.some((result) => {
-    const status = String(result?.analysis?.status || '').trim().toLowerCase();
-    return status === 'pending' || status === 'processing';
+    const itemStatus = String(result?.status || '').trim().toLowerCase();
+    const analysisStatus = String(
+      result?.analysis?.normalizedStatus || result?.analysis?.status || '',
+    ).trim().toLowerCase();
+    const status = itemStatus || analysisStatus;
+    return ACTIVE_STATUS_VALUES.has(status);
   });
+}
+
+function buildVideoExtractStatusPollBody(originalBody, payload) {
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const items = results
+    .map((result) => {
+      const resolved = isJsonObject(result?.resolvedVideo)
+        ? result.resolvedVideo
+        : (isJsonObject(result?.resolved) ? result.resolved : {});
+      const videoUid = trimString(resolved.videoUid || resolved.video_uid);
+      if (videoUid) return { videoUid };
+      const platformVideoId = trimString(
+        resolved.platformVideoId || resolved.platform_video_id,
+      );
+      if (platformVideoId) {
+        const item = { platformVideoId };
+        if (Number.isInteger(resolved.platformId)) {
+          item.platformId = resolved.platformId;
+        } else if (Number.isInteger(resolved.platform_id)) {
+          item.platformId = resolved.platform_id;
+        }
+        return item;
+      }
+      const request = isJsonObject(result?.request) ? result.request : null;
+      if (!request || request.url) return null;
+      return request;
+    })
+    .filter(Boolean);
+
+  if (items.length === 0) {
+    const originalHasUrl = Array.isArray(originalBody.items) &&
+      originalBody.items.some((item) => Boolean(item?.url));
+    if (originalHasUrl) return null;
+    return originalBody;
+  }
+
+  return {
+    workspaceId: originalBody.workspaceId,
+    action: 'status',
+    items,
+    includeRawAnalysis: originalBody.includeRawAnalysis === true,
+    includeAssets: false,
+    includeSourceVideo: false,
+    ensureAnalysis: false,
+  };
 }
 
 async function downloadAssetToFile({ url, outDir, stem, timeoutMs }) {
@@ -1020,6 +1829,23 @@ function resolvePayloadWorkspaceId(payload, fallbackWorkspaceId) {
   return fallbackWorkspaceId || null;
 }
 
+function isGeneratedAssetShareScopedAction(functionName, payload) {
+  if (functionName !== 'vnext-generated-asset-share' || !isJsonObject(payload)) {
+    return false;
+  }
+  const action = trimString(payload.action).toLowerCase();
+  return action === 'create' || action === 'revoke';
+}
+
+function shouldRequireToolWorkspace(functionName, payload) {
+  const tool = getKnownTool(functionName);
+  const category = trimString(tool?.category).toLowerCase();
+  return (
+    Boolean(tool?.workspaceScoped) &&
+      (category === 'asset-studio' || category === 'video-production')
+  ) || isGeneratedAssetShareScopedAction(functionName, payload);
+}
+
 function isUuidLike(value) {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value.trim());
 }
@@ -1064,7 +1890,7 @@ function parseToolStatusKind(rawKind) {
   throw new CliError(`Unsupported tools status kind: ${rawKind}`, {
     code: 'INVALID_ARGUMENT',
     exitCode: EXIT_CODES.USAGE,
-    hint: 'Use --kind auto|agent_job|google_ai_run|journey_run.',
+    hint: 'Use --kind auto|agent_job|google_ai_run|journey_run|explore_run.',
   });
 }
 
@@ -2541,6 +3367,7 @@ async function pollSearchJourneyRun({
 function mapStatusToExitCode(status) {
   if (status === 401 || status === 403) return EXIT_CODES.AUTH;
   if (status === 404) return EXIT_CODES.NOT_FOUND;
+  if (status === 410) return EXIT_CODES.LEGACY_RETIRED;
   if (status >= 500) return EXIT_CODES.SERVER;
   if (status >= 400) return EXIT_CODES.USAGE;
   return EXIT_CODES.UNKNOWN;
@@ -2556,7 +3383,9 @@ function buildStatusHint(status, context = {}) {
   switch (status) {
     case 401:
     case 403:
-      return 'Check your CLI key and workspace access.';
+      return 'Authentication failed. Run `socialseal login`, or check your CLI key and workspace access.';
+    case 402:
+      return 'Your free credits or quota may be exhausted. Run `socialseal billing` to open billing and credits options.';
     case 404:
       if (context.functionName) {
         if (isLocallyDisabledByDefaultFunction(context.functionName)) {
@@ -2567,9 +3396,14 @@ function buildStatusHint(status, context = {}) {
       return 'Check the API base URL and endpoint path.';
     case 405:
       return `Method not allowed. Try --method GET or ensure the endpoint supports ${context.method || 'this method'}.`;
+    case 410:
+      return 'This surface is retired and performs no work. See the response payload for the replacement capability, migration guidance, and correlation ID.';
     case 422:
       return 'Validation error. Review the JSON payload schema. For tracking/group tools, prefer the CLI action aliases or the documented REST semantics.';
     default:
+      if (context.billingRelated) {
+        return 'Run `socialseal billing` to open billing and credits options.';
+      }
       return null;
   }
 }
@@ -2579,6 +3413,38 @@ function truncateDetails(value, limit = 2000) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (text.length <= limit) return value;
   return `${text.slice(0, limit)}…`;
+}
+
+function isLegacyRetiredPayload(details) {
+  return Boolean(
+    details
+    && typeof details === 'object'
+    && !Array.isArray(details)
+    && details.code === 'legacy_surface_retired',
+  );
+}
+
+function buildLegacyRetiredError(label, details) {
+  const replacement = typeof details.replacement === 'string' ? details.replacement : null;
+  const guidance = typeof details.guidance === 'string' ? details.guidance : null;
+  const correlationId = typeof details.correlation_id === 'string' ? details.correlation_id : null;
+  const minClientVersion = typeof details.min_client_version === 'string'
+    ? details.min_client_version
+    : null;
+  const lines = [
+    `${label} failed: 410 Gone — the surface is retired and performs no work.`,
+    replacement ? `Replacement capability: ${replacement}` : null,
+    minClientVersion ? `Minimum client version: ${minClientVersion}` : null,
+    guidance ? `Migration guidance: ${guidance}` : null,
+    correlationId ? `Correlation ID: ${correlationId}` : null,
+  ].filter(Boolean);
+  return new CliError(lines.join('\n'), {
+    code: 'LEGACY_SURFACE_RETIRED',
+    exitCode: EXIT_CODES.LEGACY_RETIRED,
+    status: 410,
+    hint: 'Use the listed replacement capability, or update this client to a version that targets it.',
+    details,
+  });
 }
 
 async function buildHttpError(res, context = {}) {
@@ -2595,11 +3461,22 @@ async function buildHttpError(res, context = {}) {
   }
 
   const label = context.label || 'Request';
+  if (isLegacyRetiredPayload(details)) {
+    return buildLegacyRetiredError(label, details);
+  }
   const statusText = res.statusText ? ` ${res.statusText}` : '';
-  const hint = context.hint || buildStatusHint(status, context);
+  const serializedDetails = typeof details === 'string' ? details : JSON.stringify(details);
+  const billingRelated = /\b(credit|credits|quota|billing|entitlement|payment|plan)\b/i.test(serializedDetails || '');
+  const hint = context.hint || buildStatusHint(status, { ...context, billingRelated });
+  const upstreamCode = context.functionName === 'explore-api' && isJsonObject(details)
+    ? trimString(details.error || details.code || '')
+    : '';
+  const upstreamMessage = context.functionName === 'explore-api' && isJsonObject(details)
+    ? trimString(details.message || '')
+    : '';
 
-  return new CliError(`${label} failed: ${status}${statusText}`.trim(), {
-    code: 'HTTP_ERROR',
+  return new CliError((upstreamMessage || `${label} failed: ${status}${statusText}`).trim(), {
+    code: upstreamCode || 'HTTP_ERROR',
     exitCode: mapStatusToExitCode(status),
     status,
     hint,
@@ -2632,6 +3509,9 @@ async function callToolJson({
   label,
 }) {
   const path = useGateway ? `/cli/tools/${functionName}` : `/functions/v1/${functionName}`;
+  const requestTimeoutMs = functionName === 'explore-api'
+    ? Math.min(timeoutMs ?? 15000, 15000)
+    : timeoutMs;
   const res = await callApi({
     apiBase: useGateway ? apiBase : legacyUrl,
     apiKey,
@@ -2639,7 +3519,7 @@ async function callToolJson({
     method: 'POST',
     body,
     workspaceId,
-    timeoutMs,
+    timeoutMs: requestTimeoutMs,
   });
 
   if (res.status === 404) {
@@ -2742,6 +3622,46 @@ async function readSearchJourneyRunStatus({
   };
 }
 
+async function readExploreRunStatus({
+  apiBase,
+  apiKey,
+  useGateway,
+  legacyUrl,
+  timeoutMs,
+  workspaceId,
+  runId,
+}) {
+  if (!workspaceId) {
+    throw new CliError('Explore run status requires a workspace id.', {
+      code: 'WORKSPACE_REQUIRED',
+      exitCode: EXIT_CODES.USAGE,
+      hint: 'Pass --workspace-id, set SOCIALSEAL_WORKSPACE_ID, or configure a default workspace.',
+    });
+  }
+  const response = await callToolJson({
+    apiBase,
+    apiKey,
+    useGateway,
+    legacyUrl,
+    functionName: 'explore-api',
+    body: { action: 'runStatus', workspaceId, runId },
+    workspaceId,
+    timeoutMs,
+    label: 'Explore run status',
+  });
+  if (response.notFound) return null;
+  const data = response.data;
+  const run = isJsonObject(data) && isJsonObject(data.run) ? data.run : null;
+  const status = run ? trimString(run.executionStatus || run.execution_status || run.status || '') : '';
+  return {
+    ...(isJsonObject(data) ? data : { raw: data }),
+    kind: 'explore_run',
+    id: runId,
+    workspaceId,
+    status,
+  };
+}
+
 async function readGoogleAiRunStatus({
   apiBase,
   apiKey,
@@ -2834,6 +3754,13 @@ function buildToolStatusNotFoundError(identifier, kind, workspaceId) {
       hint: 'Verify --workspace-id and the journey run UUID, then retry.',
     });
   }
+  if (kind === 'explore_run') {
+    return new CliError(`Explore run not found: ${identifier.rawId}`, {
+      code: 'STATUS_NOT_FOUND',
+      exitCode: EXIT_CODES.NOT_FOUND,
+      hint: 'Verify --workspace-id and the Explore run UUID, then retry.',
+    });
+  }
   return new CliError(`No matching status record found for ${identifier.rawId}.`, {
     code: 'STATUS_NOT_FOUND',
     exitCode: EXIT_CODES.NOT_FOUND,
@@ -2915,6 +3842,26 @@ async function resolveUnifiedToolStatus({
     throw buildToolStatusNotFoundError(identifier, kind, workspaceId);
   }
 
+  if (kind === 'explore_run') {
+    if (!identifier.uuidId) {
+      throw new CliError('explore_run status expects a UUID run id.', {
+        code: 'INVALID_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+      });
+    }
+    const result = await readExploreRunStatus({
+      apiBase,
+      apiKey,
+      useGateway,
+      legacyUrl,
+      timeoutMs,
+      workspaceId,
+      runId: identifier.uuidId,
+    });
+    if (result) return result;
+    throw buildToolStatusNotFoundError(identifier, kind, workspaceId);
+  }
+
   if (identifier.numericId != null) {
     const result = await readGoogleAiRunStatus({
       apiBase,
@@ -2969,6 +3916,11 @@ function buildStatusCommandHint(result, workspaceId) {
     if (!scopedWorkspace) return null;
     return `socialseal tools status ${result.id} --kind journey_run --workspace-id ${scopedWorkspace}`;
   }
+  if (result.kind === 'explore_run') {
+    const scopedWorkspace = workspaceId || result.workspaceId;
+    if (!scopedWorkspace) return null;
+    return `socialseal tools status ${result.id} --kind explore_run --workspace-id ${scopedWorkspace}`;
+  }
   return null;
 }
 
@@ -2991,6 +3943,14 @@ function maybeEmitFollowupStatusHint({ functionName, data, workspaceId }) {
     const workspaceFlag = scopedWorkspace ? ` --workspace-id ${scopedWorkspace}` : '';
     process.stderr.write(
       `[socialseal] Search journey run id: ${data.runId}. Use: socialseal tools status ${data.runId} --kind journey_run${workspaceFlag}\n`,
+    );
+    return;
+  }
+  if (functionName === 'explore-api' && typeof data.runId === 'string' && isUuidLike(data.runId)) {
+    const scopedWorkspace = trimString(workspaceId || data.workspaceId || '');
+    const workspaceFlag = scopedWorkspace ? ` --workspace-id ${scopedWorkspace}` : '';
+    process.stderr.write(
+      `[socialseal] Explore run id: ${data.runId}. Use: socialseal tools status ${data.runId} --kind explore_run${workspaceFlag}\n`,
     );
   }
 }
@@ -3080,9 +4040,10 @@ function coerceCliError(err, fallbackMessage = 'Command failed') {
 function requireApiKey(opts, config) {
   const apiKey = resolveApiKey(opts, config);
   if (!apiKey) {
-    throw new CliError('Missing API key. Set SOCIALSEAL_API_KEY or --api-key.', {
+    throw new CliError('Missing API key. Run `socialseal login` to connect this CLI.', {
       code: 'MISSING_API_KEY',
-      exitCode: EXIT_CODES.USAGE,
+      exitCode: EXIT_CODES.AUTH,
+      hint: 'Run `socialseal login`, or set SOCIALSEAL_API_KEY if you already have a key.',
     });
   }
   return apiKey;
@@ -3542,6 +4503,232 @@ async function handleAgentRun(opts) {
   });
 }
 
+function exploreRunIdFromResponse(data) {
+  if (!isJsonObject(data)) return null;
+  if (typeof data.runId === 'string' && isUuidLike(data.runId)) return data.runId;
+  if (isJsonObject(data.result) && typeof data.result.runId === 'string' && isUuidLike(data.result.runId)) {
+    return data.result.runId;
+  }
+  return null;
+}
+
+function validateExploreSelectionItems(items) {
+  const seen = new Set();
+  let includedCount = 0;
+  for (const item of items) {
+    if (!isJsonObject(item) || typeof item.itemKind !== 'string' || typeof item.targetId !== 'string' || item.targetId.trim().length === 0 || !['search_term', 'candidate_topic', 'evidence_ref', 'context_ref'].includes(item.itemKind) || !['included', 'excluded'].includes(item.inclusionState)) {
+      throw new CliError('Explore selection items must use itemKind, targetId, and inclusionState.', {
+        code: 'INVALID_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+      });
+    }
+    const key = `${item.itemKind}:${item.targetId.toLowerCase()}`;
+    if (seen.has(key)) {
+      throw new CliError('Explore selection item identities must be unique by itemKind and targetId.', {
+        code: 'INVALID_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+      });
+    }
+    seen.add(key);
+    if (item.inclusionState === 'included') includedCount += 1;
+  }
+  if (items.length === 0 || includedCount === 0) {
+    throw new CliError('Explore selections require at least one included item.', {
+      code: 'INVALID_ARGUMENT',
+      exitCode: EXIT_CODES.USAGE,
+    });
+  }
+}
+
+function exploreCommandBody(action, payload, opts, workspaceId) {
+  const body = { ...(isJsonObject(payload) ? payload : {}), action };
+  const directJsonFields = {
+    anchor: opts.anchor,
+    evidenceWindow: opts.evidenceWindow,
+    providerBasket: opts.providerBasket,
+    items: opts.items,
+    bindings: opts.bindings,
+    topicMappings: opts.topicMappings,
+    continuationMetadata: opts.continuationMetadata,
+    labels: opts.labels,
+    memberships: opts.memberships,
+    targetMemberships: opts.targetMemberships,
+    newCandidateTopic: opts.newCandidateTopic,
+  };
+  for (const [key, value] of Object.entries(directJsonFields)) {
+    if (value !== undefined) body[key] = parseJsonInput(value, { label: key });
+  }
+  const directFields = {
+    marketCode: opts.marketCode,
+    languageTag: opts.languageTag,
+    sourceKind: opts.sourceKind,
+    sourceRef: opts.sourceRef,
+    intentFingerprint: opts.intentFingerprint,
+    previewFingerprint: opts.previewFingerprint,
+    lineageId: opts.lineageId,
+    snapshotId: opts.snapshotId,
+    beforeSnapshotId: opts.beforeSnapshotId,
+    afterSnapshotId: opts.afterSnapshotId,
+    runId: opts.runId,
+    selectionId: opts.selectionId,
+    interpretationRevisionId: opts.interpretationRevisionId,
+    expectedRevisionId: opts.expectedRevisionId,
+    operation: opts.operation,
+    selectedCandidateTopicId: opts.selectedCandidateTopicId,
+    targetCandidateTopicId: opts.targetCandidateTopicId,
+    status: opts.status,
+    changeSummary: opts.changeSummary,
+    intendedDestination: opts.intendedDestination,
+    intendedUse: opts.intendedUse,
+    userQuestion: opts.userQuestion,
+    planFingerprint: opts.planFingerprint,
+    targetMonitorId: opts.targetMonitorId,
+    expectedScopeVersionId: opts.expectedScopeVersionId,
+    focalBrandId: opts.focalBrandId,
+    monitorName: opts.monitorName,
+    canonicalInputHash: opts.canonicalInputHash,
+    destination: opts.destination,
+    idempotencyKey: opts.idempotencyKey,
+    limit: opts.limit,
+    page: opts.page,
+    pageSize: opts.pageSize,
+    sort: opts.sort,
+    outcome: opts.outcome,
+  };
+  for (const [key, value] of Object.entries(directFields)) {
+    if (value !== undefined) body[key] = value;
+  }
+  if (workspaceId) body.workspaceId = workspaceId;
+
+  for (const field of EXPLORE_REQUIRED_FIELDS_BY_ACTION[action] || []) {
+    const value = body[field];
+    if (value === undefined || (value === null && field !== 'expectedRevisionId') || (typeof value === 'string' && value.trim().length === 0)) {
+      throw new CliError(`Explore ${action} requires ${field}.`, {
+        code: 'MISSING_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+        hint: `Pass --body @${action}.json or the corresponding Explore option.`,
+      });
+    }
+  }
+  for (const field of ['limit', 'page', 'pageSize']) {
+    if (body[field] === undefined) continue;
+    const numeric = Number(body[field]);
+    if (!Number.isInteger(numeric) || numeric <= 0) {
+      throw new CliError(`Explore ${field} must be a positive integer.`, {
+        code: 'INVALID_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+      });
+    }
+    body[field] = numeric;
+  }
+  if (body.pageSize > EXPLORE_MAX_PAGE_SIZE || body.limit > EXPLORE_MAX_OVERVIEW_LIMIT) {
+    throw new CliError('Explore read window exceeds the canonical limit.', {
+      code: 'INVALID_ARGUMENT',
+      exitCode: EXIT_CODES.USAGE,
+      hint: `Use pageSize <= ${EXPLORE_MAX_PAGE_SIZE} and limit <= ${EXPLORE_MAX_OVERVIEW_LIMIT}.`,
+    });
+  }
+  for (const field of ['providerBasket', 'items', 'bindings', 'topicMappings', 'labels', 'memberships', 'targetMemberships']) {
+    if (body[field] !== undefined && !Array.isArray(body[field])) {
+      throw new CliError(`Explore ${field} must be a JSON array.`, {
+        code: 'INVALID_ARGUMENT',
+        exitCode: EXIT_CODES.USAGE,
+      });
+    }
+  }
+  if (action === 'createSelection') validateExploreSelectionItems(body.items);
+  if (action === 'prepareHandoff' && !EXPLORE_HANDOFF_DESTINATIONS.includes(body.destination)) {
+    throw new CliError('Explore handoff destination is unsupported.', {
+      code: 'INVALID_ARGUMENT',
+      exitCode: EXIT_CODES.USAGE,
+    });
+  }
+  if (EXPLORE_WRITE_ACTIONS.has(action) && !isJsonObject(body)) {
+    throw new CliError(`Explore ${action} requires a JSON object body.`, {
+      code: 'INVALID_PAYLOAD',
+      exitCode: EXIT_CODES.USAGE,
+    });
+  }
+  return body;
+}
+
+async function handleExploreCommand(opts) {
+  const config = loadConfig();
+  const apiKey = requireApiKey(opts, config);
+  const apiBase = resolveApiBase(opts, config);
+  const supabaseUrl = resolveLegacyUrl(resolveSupabaseUrl(opts, config), 'SOCIALSEAL_SUPABASE_URL');
+  const { resolvedApiBase, legacyUrl, useGateway } = resolveApiTarget({ apiBase, legacyUrl: supabaseUrl });
+  const timeoutMs = resolveTimeoutMs(opts, config);
+  const selection = resolveWorkspaceSelection(opts, config);
+  const parsedPayload = ensureJsonObject(parseJsonInput(opts.body, { label: 'body' }) ?? {}, 'body');
+  const bodyWorkspaceId = resolvePayloadWorkspaceId(parsedPayload, null);
+  if (selection.workspaceId && bodyWorkspaceId && selection.workspaceId !== bodyWorkspaceId) {
+    throw new CliError('Explore workspaceId conflicts with --workspace-id or the configured workspace.', {
+      code: 'WORKSPACE_CONFLICT',
+      exitCode: EXIT_CODES.USAGE,
+      hint: 'Use one exact workspace id for the operation.',
+    });
+  }
+  const action = opts.exploreAction === 'get'
+    ? ({ lineage: 'lineage', snapshot: 'snapshot', run: 'runStatus', selection: 'selection', compare: 'compareSnapshots' }[opts.resource || 'lineage'] || 'lineage')
+    : opts.exploreAction;
+  const effectiveWorkspaceId = bodyWorkspaceId || selection.workspaceId;
+  const workspaceSource = bodyWorkspaceId ? 'body' : selection.source;
+  requireExploreCliVisibility(effectiveWorkspaceId, config);
+  if (!effectiveWorkspaceId) {
+    throw new CliError(`Explore ${action} requires a workspace id.`, {
+      code: 'WORKSPACE_REQUIRED',
+      exitCode: EXIT_CODES.USAGE,
+      hint: 'Pass --workspace-id or configure SOCIALSEAL_WORKSPACE_ID before using Explore.',
+    });
+  }
+  if (EXPLORE_WRITE_ACTIONS.has(action)) {
+    emitWorkspaceSelectionNotice(opts, { workspaceId: effectiveWorkspaceId, source: workspaceSource, label: `explore ${action}` });
+  }
+  const body = exploreCommandBody(action, parsedPayload, opts, effectiveWorkspaceId);
+  const response = await callToolJson({
+    apiBase: resolvedApiBase,
+    apiKey,
+    useGateway,
+    legacyUrl,
+    functionName: 'explore-api',
+    body,
+    workspaceId: effectiveWorkspaceId,
+    timeoutMs,
+    label: `Explore ${action}`,
+  });
+  if (response.notFound) {
+    throw new CliError('Explore API was not found.', {
+      code: 'NOT_FOUND',
+      exitCode: EXIT_CODES.NOT_FOUND,
+    });
+  }
+  let data = response.data;
+  const runId = exploreRunIdFromResponse(data);
+  if ((action === 'startLineage' || action === 'refreshLineage') && runId && opts.wait && opts.poll !== false) {
+    data = await pollUnifiedStatus({
+      loader: () => resolveUnifiedToolStatus({
+        apiBase: resolvedApiBase,
+        apiKey,
+        useGateway,
+        legacyUrl,
+        timeoutMs,
+        identifier: { rawId: runId, numericId: null, uuidId: runId },
+        kind: 'explore_run',
+        workspaceId: effectiveWorkspaceId,
+        includeResults: false,
+        resultsLimit: DEFAULT_STATUS_RESULTS_LIMIT,
+      }),
+      timeoutMs,
+      pollIntervalMs: resolvePollIntervalMs(opts),
+      opts,
+    });
+  } else if (runId) {
+    maybeEmitFollowupStatusHint({ functionName: 'explore-api', data, workspaceId: effectiveWorkspaceId });
+  }
+  emitJsonOutput(data, opts.pretty);
+}
+
 async function handleToolsCall(opts) {
   const config = loadConfig();
   const apiKey = requireApiKey(opts, config);
@@ -3572,6 +4759,7 @@ async function handleToolsCall(opts) {
     translated.workspaceId && translated.workspaceId !== resolvedWorkspaceId
       ? 'body'
       : (payloadWorkspaceId && payloadWorkspaceId !== resolvedWorkspaceId ? 'body' : workspaceSource);
+  if (opts.function === 'explore-api') requireExploreCliVisibility(effectiveWorkspaceId, config);
   const path = useGateway
     ? `/cli/tools/${opts.function}${translated.pathSuffix || ''}`
     : `/functions/v1/${opts.function}${translated.pathSuffix || ''}`;
@@ -3609,6 +4797,26 @@ async function handleToolsCall(opts) {
       workspaceId: effectiveWorkspaceId,
       source: effectiveWorkspaceSource,
       label: 'tracked-video-extract',
+    });
+  }
+
+  const scopedPayload = isJsonObject(translated.normalizedPayload)
+    ? translated.normalizedPayload
+    : (isJsonObject(translated.body) ? translated.body : payload);
+  const hasSpecialWorkspaceHandling = new Set([
+    'group-management',
+    'export_tracking_data',
+    'tracked-video-extract',
+  ]).has(opts.function);
+  if (!hasSpecialWorkspaceHandling && shouldRequireToolWorkspace(opts.function, scopedPayload)) {
+    requireWorkspaceSelection(effectiveWorkspaceId, {
+      label: opts.function,
+      hint: 'Pass --workspace-id, set SOCIALSEAL_WORKSPACE_ID, include workspaceId in the body, or configure a default workspace.',
+    });
+    emitWorkspaceSelectionNotice(opts, {
+      workspaceId: effectiveWorkspaceId,
+      source: effectiveWorkspaceSource,
+      label: opts.function,
     });
   }
 
@@ -3680,13 +4888,28 @@ async function handleToolsCall(opts) {
       return;
     }
 
-    const runId = isJsonObject(data) && typeof data.runId === 'string' ? data.runId : null;
-    if (!runId) {
-      throw new CliError('Async search-journey-run start response did not include a runId.', {
+    const runId = isJsonObject(data) && typeof data.runId === 'string'
+      ? data.runId.trim() || null
+      : null;
+    const queueJobId = isJsonObject(data) && typeof data.queueJobId === 'string'
+      ? data.queueJobId.trim() || null
+      : null;
+    if (!runId && !queueJobId) {
+      throw new CliError('Async search-journey-run start response did not include a runId or queueJobId.', {
         code: 'INVALID_START_RESPONSE',
         exitCode: EXIT_CODES.SERVER,
         details: truncateDetails(data),
       });
+    }
+
+    if (!runId) {
+      // Cross-entry duplicate (review round 6): the request coalesced onto a
+      // queue job whose run has not been created yet (agent-tool-jobs queued
+      // it first, the worker creates the run). There is no runId to poll;
+      // surface the queue job so the caller can track the existing work.
+      emitInfo(opts, `search-journey-run async request already queued (job ${queueJobId}); the run will be created by the worker.`);
+      emitJsonOutput(data, opts.pretty);
+      return;
     }
 
     emitInfo(opts, `search-journey-run async run started: ${runId}`);
@@ -3710,9 +4933,10 @@ async function handleToolsCall(opts) {
 }
 
 function handleToolsList(opts) {
-  const tools = buildToolRegistry();
+  const tools = filterToolRegistry(buildToolRegistry(), opts.category);
   const payload = {
     discovery: 'built_in_registry',
+    category: trimString(opts.category) || null,
     tools,
     note: STATIC_TOOL_REGISTRY_NOTE,
     schemaNote: STATIC_TOOL_SCHEMA_NOTE,
@@ -3724,6 +4948,9 @@ function handleToolsList(opts) {
   }
 
   process.stdout.write('[socialseal] Built-in tool registry\n');
+  if (payload.category) {
+    process.stdout.write(`[socialseal] Category filter: ${payload.category}\n`);
+  }
   process.stdout.write(`[socialseal] ${payload.note}\n`);
   process.stdout.write(`[socialseal] ${payload.schemaNote}\n`);
 
@@ -3740,6 +4967,9 @@ function handleToolsList(opts) {
     ].filter(Boolean);
     const qualifierText = qualifiers.length > 0 ? ` [${qualifiers.join(', ')}]` : '';
     process.stdout.write(`- ${tool.name}${qualifierText}: ${tool.description}\n`);
+    if (tool.replacement) {
+      process.stdout.write(`  replacement: ${tool.replacement}\n`);
+    }
     if (tool.notes) {
       process.stdout.write(`  note: ${tool.notes}\n`);
     }
@@ -3854,6 +5084,7 @@ async function handleToolsStatus(opts) {
   const kind = parseToolStatusKind(opts.kind);
   const identifier = normalizeStatusIdentifier(opts.id);
   const { workspaceId } = resolveWorkspaceSelection(opts, config);
+  if (kind === 'explore_run') requireExploreCliVisibility(workspaceId, config);
 
   const loadStatus = async () =>
     await resolveUnifiedToolStatus({
@@ -4448,13 +5679,13 @@ async function handleVideoExtract(opts) {
     method: 'POST',
   });
 
-  const requestOnce = async (remainingTimeoutMs) => {
+  const requestOnce = async (remainingTimeoutMs, requestBody = body) => {
     const res = await callApi({
       apiBase: useGateway ? resolvedApiBase : legacyUrl,
       apiKey,
       path,
       method: 'POST',
-      body,
+      body: requestBody,
       workspaceId: effectiveWorkspaceId,
       timeoutMs: remainingTimeoutMs,
     });
@@ -4479,6 +5710,7 @@ async function handleVideoExtract(opts) {
   };
 
   let payload = await requestOnce(timeoutMs);
+  let pollBody = buildVideoExtractStatusPollBody(body, payload);
 
   if (opts.wait) {
     const pollIntervalMs = resolvePollIntervalMs(opts);
@@ -4497,7 +5729,16 @@ async function handleVideoExtract(opts) {
 
       emitInfo(opts, 'tracked-video-extract pending; polling for completion.');
       await sleep(Math.min(pollIntervalMs, remainingMs));
-      payload = await requestOnce(Math.max(1000, deadline - Date.now()));
+      if (!pollBody) {
+        throw new CliError('Cannot poll URL analysis without a resolved video identifier.', {
+          code: 'MISSING_RESOLVED_VIDEO_ID',
+          exitCode: EXIT_CODES.SERVER,
+          hint: 'Retry without --wait, then poll with the returned videoUid or platformVideoId.',
+          details: truncateDetails(payload),
+        });
+      }
+      payload = await requestOnce(Math.max(1000, deadline - Date.now()), pollBody);
+      pollBody = buildVideoExtractStatusPollBody(body, payload);
     }
   }
 
@@ -4536,13 +5777,13 @@ async function handleVideoQueueAnalysis(opts) {
     method: 'POST',
   });
 
-  const requestOnce = async (remainingTimeoutMs) => {
+  const requestOnce = async (remainingTimeoutMs, requestBody = body) => {
     const res = await callApi({
       apiBase: useGateway ? resolvedApiBase : legacyUrl,
       apiKey,
       path,
       method: 'POST',
-      body,
+      body: requestBody,
       workspaceId: effectiveWorkspaceId,
       timeoutMs: remainingTimeoutMs,
     });
@@ -4567,6 +5808,7 @@ async function handleVideoQueueAnalysis(opts) {
   };
 
   let payload = await requestOnce(timeoutMs);
+  let pollBody = buildVideoExtractStatusPollBody(body, payload);
 
   if (opts.wait) {
     const pollIntervalMs = resolvePollIntervalMs(opts);
@@ -4585,11 +5827,272 @@ async function handleVideoQueueAnalysis(opts) {
 
       emitInfo(opts, 'tracked-video queue-analysis pending; polling for completion.');
       await sleep(Math.min(pollIntervalMs, remainingMs));
-      payload = await requestOnce(Math.max(1000, deadline - Date.now()));
+      if (!pollBody) {
+        throw new CliError('Cannot poll URL analysis without a resolved video identifier.', {
+          code: 'MISSING_RESOLVED_VIDEO_ID',
+          exitCode: EXIT_CODES.SERVER,
+          hint: 'Retry without --wait, then poll with the returned videoUid or platformVideoId.',
+          details: truncateDetails(payload),
+        });
+      }
+      payload = await requestOnce(Math.max(1000, deadline - Date.now()), pollBody);
+      pollBody = buildVideoExtractStatusPollBody(body, payload);
     }
   }
 
   emitJsonOutput(payload, opts.pretty);
+}
+
+function maskApiKey(apiKey) {
+  const key = typeof apiKey === 'string' ? apiKey.trim() : '';
+  if (!key) return null;
+  return `…${key.slice(-6)}`;
+}
+
+function openBrowser(url, onError) {
+  const platform = process.platform;
+  const command = platform === 'darwin'
+    ? 'open'
+    : platform === 'win32'
+      ? 'cmd'
+      : 'xdg-open';
+  const args = platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.on('error', (error) => {
+    if (typeof onError === 'function') onError(error);
+  });
+  child.unref();
+}
+
+async function callPublicApi({ apiBase, path: requestPath, method = 'POST', body, timeoutMs }) {
+  if (!apiBase) {
+    throw new CliError('Missing API base. Set SOCIALSEAL_API_BASE or --api-base.', {
+      code: 'MISSING_API_BASE',
+      exitCode: EXIT_CODES.USAGE,
+    });
+  }
+  const normalizedMethod = normalizeMethod(method);
+  const url = `${apiBase.replace(/\/$/, '')}${requestPath.startsWith('/') ? requestPath : `/${requestPath}`}`;
+  const hasBody = body !== undefined && normalizedMethod !== 'GET' && normalizedMethod !== 'HEAD';
+  return fetchWithTimeout(url, {
+    method: normalizedMethod,
+    headers: {
+      Accept: 'application/json',
+      ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: hasBody ? JSON.stringify(body ?? {}) : undefined,
+  }, timeoutMs ?? DEFAULT_TIMEOUT_MS);
+}
+
+async function readJsonResponse(res, label) {
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new CliError(`${label} returned a non-JSON response.`, {
+      code: 'INVALID_RESPONSE',
+      exitCode: EXIT_CODES.SERVER,
+    });
+  }
+  return res.json();
+}
+
+async function handleLogin(opts) {
+  const config = loadConfig();
+  const apiBase = resolveApiBase(opts, config) || DEFAULT_API_BASE;
+  const timeoutMs = resolveTimeoutMs(opts, config);
+  assertConfigWritable();
+  const authorizeRes = await callPublicApi({
+    apiBase,
+    path: '/cli/device/authorize',
+    body: {
+      clientId: '@socialseal/cli',
+      clientName: 'SocialSeal CLI',
+      scopes: { cli: true },
+    },
+    timeoutMs,
+  });
+
+  if (!authorizeRes.ok) {
+    throw await buildHttpError(authorizeRes, { label: 'Device authorization start' });
+  }
+
+  const authorizePayload = await readJsonResponse(authorizeRes, 'Device authorization start');
+  const verificationUrl = authorizePayload.verification_uri_complete || authorizePayload.verification_uri;
+  const deviceCode = authorizePayload.device_code;
+  const userCode = authorizePayload.user_code;
+  if (!verificationUrl || !deviceCode || !userCode) {
+    throw new CliError('Device authorization start returned an incomplete response.', {
+      code: 'INVALID_RESPONSE',
+      exitCode: EXIT_CODES.SERVER,
+    });
+  }
+
+  if (!opts.json) {
+    process.stdout.write(`[socialseal] Open this URL to approve login: ${verificationUrl}\n`);
+    process.stdout.write(`[socialseal] Confirm code: ${userCode}\n`);
+  }
+
+  if (opts.open !== false) {
+    openBrowser(String(verificationUrl), (error) => {
+      if (opts.verbose) {
+        process.stderr.write(`[socialseal] Could not open browser automatically: ${error.message || error}\n`);
+      }
+    });
+  }
+
+  const startedAt = Date.now();
+  let intervalMs = Math.max(1000, Number(authorizePayload.interval || 5) * 1000);
+  if (opts.pollInterval) {
+    intervalMs = parseTimeoutMs(opts.pollInterval, { defaultValue: intervalMs, label: 'poll interval' });
+  }
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await sleep(intervalMs);
+    const tokenRes = await callPublicApi({
+      apiBase,
+      path: '/cli/device/token',
+      body: { device_code: deviceCode },
+      timeoutMs: Math.max(1000, timeoutMs - (Date.now() - startedAt)),
+    });
+    const tokenPayload = await readJsonResponse(tokenRes, 'Device token poll');
+
+    if (tokenRes.ok) {
+      const apiKey = typeof tokenPayload.api_key === 'string' ? tokenPayload.api_key : '';
+      if (!apiKey) {
+        throw new CliError('Device token poll returned no API key.', {
+          code: 'INVALID_RESPONSE',
+          exitCode: EXIT_CODES.SERVER,
+        });
+      }
+
+      const workspaceId = typeof tokenPayload.workspace_id === 'string' ? tokenPayload.workspace_id : config.workspaceId;
+      saveConfig({
+        ...config,
+        apiBase,
+        apiKey,
+        workspaceId,
+      });
+
+      const payload = {
+        success: true,
+        apiBase,
+        keySuffix: apiKey.slice(-6),
+        key: maskApiKey(apiKey),
+        workspaceId: workspaceId || null,
+        configPath: getConfigPath(),
+      };
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(payload, null, opts.pretty ? 2 : 0) + '\n');
+        return;
+      }
+
+      process.stdout.write(`[socialseal] Login complete. Stored key ${maskApiKey(apiKey)} in ${getConfigPath()}\n`);
+      if (workspaceId) {
+        process.stdout.write(`[socialseal] Default workspace set to ${workspaceId}\n`);
+      }
+      return;
+    }
+
+    if (tokenPayload?.error === 'authorization_pending') {
+      if (!opts.json) process.stdout.write('[socialseal] Waiting for browser approval…\n');
+      continue;
+    }
+    if (tokenPayload?.error === 'slow_down') {
+      intervalMs = Math.min(intervalMs + 5000, 60000);
+      continue;
+    }
+
+    throw await buildHttpError(new Response(JSON.stringify(tokenPayload), {
+      status: tokenRes.status,
+      statusText: tokenRes.statusText,
+      headers: { 'Content-Type': 'application/json' },
+    }), { label: 'Device token poll' });
+  }
+
+  throw new CliError('Timed out waiting for browser approval.', {
+    code: 'DEVICE_LOGIN_TIMEOUT',
+    exitCode: EXIT_CODES.AUTH,
+    hint: 'Run `socialseal login` again when you are ready to approve in the browser.',
+  });
+}
+
+function handleLogout(opts) {
+  const config = loadConfig();
+  const hadApiKey = Boolean(resolveApiKey({}, config));
+  const nextConfig = { ...config };
+  delete nextConfig.apiKey;
+  saveConfig(nextConfig);
+
+  const payload = {
+    success: true,
+    removedLocalKey: hadApiKey,
+    configPath: getConfigPath(),
+  };
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(payload, null, opts.pretty ? 2 : 0) + '\n');
+    return;
+  }
+  process.stdout.write('[socialseal] Logged out locally. Any server-side key remains revocable from SocialSeal settings.\n');
+}
+
+async function handleWhoami(opts) {
+  const config = loadConfig();
+  const apiKey = requireApiKey(opts, config);
+  const apiBase = resolveApiBase(opts, config);
+  const { resolvedApiBase } = resolveApiTarget({ apiBase, legacyUrl: null });
+  const timeoutMs = resolveTimeoutMs(opts, config);
+  const directory = await fetchWorkspaceDirectory({
+    apiBase: resolvedApiBase,
+    apiKey,
+    timeoutMs,
+  });
+  const selection = resolveWorkspaceSelection({}, config);
+  const workspaces = Array.isArray(directory.workspaces) ? directory.workspaces : [];
+  const workspace = selection.workspaceId
+    ? workspaces.find((entry) => entry.id === selection.workspaceId) || null
+    : null;
+  const payload = {
+    authenticated: true,
+    apiBase: resolvedApiBase,
+    key: maskApiKey(apiKey),
+    keySuffix: apiKey.slice(-6),
+    effectiveWorkspaceId: selection.workspaceId,
+    effectiveWorkspaceSource: selection.source,
+    workspace,
+    workspaceCount: workspaces.length,
+  };
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(payload, null, opts.pretty ? 2 : 0) + '\n');
+    return;
+  }
+
+  process.stdout.write(`[socialseal] Authenticated with key ${maskApiKey(apiKey)}\n`);
+  if (workspace) {
+    process.stdout.write(`[socialseal] Workspace: ${workspace.name} (${workspace.id})\n`);
+  } else if (directory.defaultWorkspaceId) {
+    process.stdout.write(`[socialseal] Suggested workspace: ${directory.defaultWorkspaceId}\n`);
+  }
+}
+
+function handleBilling(opts) {
+  const config = loadConfig();
+  const webBase = resolveWebBase(opts, config);
+  const billingUrl = `${webBase.replace(/\/$/, '')}/settings/billing`;
+  const payload = {
+    billingUrl,
+    note: 'SocialSeal starts on the free tier. Use billing only when credits or quotas are exhausted.',
+  };
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(payload, null, opts.pretty ? 2 : 0) + '\n');
+    return;
+  }
+
+  process.stdout.write(`[socialseal] Billing and credits: ${billingUrl}\n`);
+  process.stdout.write('[socialseal] SocialSeal starts on the free tier. Add billing only when you need more capacity.\n');
 }
 
 async function handleWorkspaceList(opts) {
@@ -4751,7 +6254,47 @@ if (typeof program.showHelpAfterError === 'function') {
 if (typeof program.showSuggestionAfterError === 'function') {
   program.showSuggestionAfterError(true);
 }
-program.addHelpText('after', `\nExamples:\n  socialseal workspace list\n  socialseal workspace use <workspace-id>\n  socialseal agent run --message "ping"\n  socialseal tools list\n  socialseal tools schema --function search-journey-run\n  socialseal tools call --function <tool> --body @payload.json\n  socialseal tools status 6809 --kind google_ai_run\n  socialseal tools status <run-uuid> --kind journey_run --workspace-id <uuid>\n  socialseal video queue-analysis --video-id 734829384 --workspace-id <uuid>\n  socialseal video extract --video-id 734829384 --wait --out-dir ./video-assets\n  socialseal data export-options\n  socialseal data export-tracking --group-id 123 --time-period 30d\n  socialseal data export-search-results --group-ids 123,124 --workspace-id <uuid> --out ranked.csv\n  socialseal data export-group-evidence --group-id 123 --workspace-id <uuid> --out evidence.csv\n`);
+program.addHelpText('after', `\nExamples:\n  socialseal login\n  socialseal whoami\n  socialseal workspace list\n  socialseal workspace use <workspace-id>\n  socialseal agent run --message "ping"\n  socialseal tools list\n  socialseal tools schema --function search-journey-run\n  socialseal tools call --function <tool> --body @payload.json\n  socialseal tools status 6809 --kind google_ai_run\n  socialseal tools status <run-uuid> --kind journey_run --workspace-id <uuid>\n  socialseal video queue-analysis --video-id 734829384 --workspace-id <uuid>\n  socialseal video extract --video-id 734829384 --wait --out-dir ./video-assets\n  socialseal data export-options\n  socialseal data export-tracking --group-id 123 --time-period 30d\n  socialseal data export-search-results --group-ids 123,124 --workspace-id <uuid> --out ranked.csv\n  socialseal data export-group-evidence --group-id 123 --workspace-id <uuid> --out evidence.csv\n`);
+
+program
+  .command('login')
+  .description('Start browser-based device login and store a local CLI key')
+  .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
+  .option('--no-open', 'Print the approval URL without opening a browser')
+  .option('--json', 'Emit machine-readable output')
+  .option('--pretty', 'Pretty-print JSON')
+  .option('--timeout <ms>', 'Overall login timeout in milliseconds')
+  .option('--poll-interval <ms>', 'Polling interval in milliseconds')
+  .option('--verbose', 'Show error details')
+  .action((opts) => runCommand(handleLogin, opts));
+
+program
+  .command('logout')
+  .description('Remove the locally stored SocialSeal CLI key')
+  .option('--json', 'Emit machine-readable output')
+  .option('--pretty', 'Pretty-print JSON')
+  .option('--verbose', 'Show error details')
+  .action((opts) => runCommand(handleLogout, opts));
+
+program
+  .command('whoami')
+  .description('Show the current SocialSeal CLI authentication and workspace')
+  .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
+  .option('--api-key <key>', 'CLI API key')
+  .option('--json', 'Emit machine-readable output')
+  .option('--pretty', 'Pretty-print JSON')
+  .option('--timeout <ms>', 'Request timeout in milliseconds')
+  .option('--verbose', 'Show error details')
+  .action((opts) => runCommand(handleWhoami, opts));
+
+program
+  .command('billing')
+  .description('Show where to manage SocialSeal billing and credits')
+  .option('--web-base <url>', 'Web app base URL')
+  .option('--json', 'Emit machine-readable output')
+  .option('--pretty', 'Pretty-print JSON')
+  .option('--verbose', 'Show error details')
+  .action((opts) => runCommand(handleBilling, opts));
 
 program
   .command('agent')
@@ -4819,6 +6362,7 @@ const tools = program.command('tools').description('Call edge functions directly
 tools
   .command('list')
   .description('List built-in tool registry entries')
+  .option('--category <name>', 'Filter tools by category')
   .option('--json', 'Emit machine-readable output')
   .option('--pretty', 'Pretty-print JSON')
   .option('--verbose', 'Show error details')
@@ -4853,7 +6397,7 @@ tools
 tools
   .command('status <id>')
   .description('Read unified status for UUID jobs, journey run UUIDs, or numeric Google AI run ids')
-  .option('--kind <kind>', 'auto|agent_job|google_ai_run|journey_run', 'auto')
+  .option('--kind <kind>', 'auto|agent_job|google_ai_run|journey_run|explore_run', 'auto')
   .option('--wait', 'Poll until status reaches a terminal state')
   .option('--poll-interval <ms>', 'Polling interval in milliseconds when --wait is enabled')
   .option('--include-results', 'Include Google AI summary/citation rows when reading numeric run ids')
@@ -4866,6 +6410,143 @@ tools
   .option('--timeout <ms>', 'Request timeout in milliseconds')
   .option('--verbose', 'Show error details')
   .action((id, opts) => runCommand(handleToolsStatus, { ...opts, id }));
+
+function addExploreCommandOptions(command) {
+  return command
+    .option('--body <jsonOrFile>', 'Canonical JSON body or @file.json')
+    .option('--workspace-id <id>', 'Workspace id (required for Explore writes)')
+    .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
+    .option('--api-key <key>', 'CLI API key')
+    .option('--pretty', 'Pretty-print JSON')
+    .option('--json', 'Emit machine-readable errors')
+    .option('--timeout <ms>', 'Request timeout in milliseconds')
+    .option('--wait', 'Poll start/refresh until the Explore run reaches a terminal state')
+    .option('--no-poll', 'Do not poll an async Explore run')
+    .option('--poll-interval <ms>', 'Polling interval in milliseconds when --wait is enabled')
+    .option('--include-evidence', 'Retain all evidence/source/component details in the canonical response')
+    .option('--verbose', 'Show error details');
+}
+
+const cliStartupConfig = loadConfig();
+
+if (isExploreCliRegistered(cliStartupConfig)) {
+const explore = program.command('explore').description('Read and advance the canonical Explore demand workflow');
+
+addExploreCommandOptions(explore.command('start'))
+  .description('Start an Explore lineage acquisition')
+  .option('--anchor <jsonOrFile>', 'Typed Explore anchor JSON or @file.json')
+  .option('--market-code <code>', 'Market code')
+  .option('--language-tag <tag>', 'Language tag')
+  .option('--source-kind <kind>', 'manual|api|visibility_check_import|migration')
+  .option('--source-ref <ref>', 'Immutable source reference')
+  .option('--intent-fingerprint <fingerprint>', 'Intent fingerprint')
+  .option('--provider-basket <jsonOrFile>', 'Provider basket JSON array or @file.json')
+  .option('--evidence-window <jsonOrFile>', 'Evidence window JSON or @file.json')
+  .option('--preview-fingerprint <fingerprint>', 'Server-issued start preview fingerprint')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'startLineage' }));
+
+addExploreCommandOptions(explore.command('list'))
+  .description('List the workspace Explore overview')
+  .option('--limit <n>', 'Maximum overview rows')
+  .option('--page <n>', 'Page number')
+  .option('--page-size <n>', 'Page size')
+  .option('--sort <sort>', 'created_desc|version_desc|display_order_asc')
+  .option('--outcome <outcome>', 'complete|partial|thin|missing_data|failed')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'workspaceOverview' }));
+
+addExploreCommandOptions(explore.command('get'))
+  .description('Get one Explore lineage, snapshot, run, selection, or comparison')
+  .option('--resource <resource>', 'lineage|snapshot|run|selection|compare', 'lineage')
+  .option('--lineage-id <id>', 'Lineage UUID')
+  .option('--snapshot-id <id>', 'Snapshot UUID')
+  .option('--run-id <id>', 'Explore run UUID')
+  .option('--selection-id <id>', 'Selection UUID')
+  .option('--before-snapshot-id <id>', 'Before snapshot UUID for compare')
+  .option('--after-snapshot-id <id>', 'After snapshot UUID for compare')
+  .option('--page <n>', 'Page number')
+  .option('--page-size <n>', 'Page size')
+  .option('--sort <sort>', 'created_desc|version_desc|display_order_asc')
+  .option('--outcome <outcome>', 'complete|partial|thin|missing_data|failed')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'get' }));
+
+addExploreCommandOptions(explore.command('refresh'))
+  .description('Refresh an Explore lineage')
+  .option('--lineage-id <id>', 'Lineage UUID')
+  .option('--provider-basket <jsonOrFile>', 'Provider basket JSON array or @file.json')
+  .option('--evidence-window <jsonOrFile>', 'Evidence window JSON or @file.json')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'refreshLineage' }));
+
+addExploreCommandOptions(explore.command('correct'))
+  .description('Apply an Explore interpretation correction')
+  .option('--lineage-id <id>', 'Lineage UUID')
+  .option('--snapshot-id <id>', 'Snapshot UUID')
+  .option('--expected-revision-id <id>', 'Expected interpretation revision UUID; use --body for null')
+  .option('--operation <operation>', 'rename|create|accepted_move|secondary_membership|split|merge|retire')
+  .option('--selected-candidate-topic-id <id>', 'Selected candidate topic UUID')
+  .option('--target-candidate-topic-id <id>', 'Target candidate topic UUID')
+  .option('--target-memberships <jsonOrFile>', 'Target memberships JSON array or @file.json')
+  .option('--new-candidate-topic <jsonOrFile>', 'New candidate topic JSON or @file.json')
+  .option('--status <status>', 'proposed|accepted')
+  .option('--labels <jsonOrFile>', 'Exact interpretation labels JSON array or @file.json')
+  .option('--memberships <jsonOrFile>', 'Exact interpretation memberships JSON array or @file.json')
+  .option('--change-summary <text>', 'Correction summary')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: EXPLORE_CHANNEL_ACTIONS.correct.action }));
+
+addExploreCommandOptions(explore.command('select'))
+  .description('Create an exact Explore selection')
+  .option('--lineage-id <id>', 'Lineage UUID')
+  .option('--snapshot-id <id>', 'Snapshot UUID')
+  .option('--interpretation-revision-id <id>', 'Interpretation revision UUID')
+  .option('--intended-destination <destination>', 'monitor|study|create|find_creators|seal|deliverable_share')
+  .option('--intended-use <text>', 'Intended use for the selection')
+  .option('--user-question <text>', 'Original user question')
+  .option('--continuation-metadata <jsonOrFile>', 'Continuation metadata JSON or @file.json')
+  .option('--items <jsonOrFile>', 'Exact selected items JSON array or @file.json')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'createSelection' }));
+
+addExploreCommandOptions(explore.command('preview-activation'))
+  .description('Preview the server-owned Explore activation plan')
+  .option('--selection-id <id>', 'Selection UUID')
+  .option('--bindings <jsonOrFile>', 'Optional activation bindings JSON array or @file.json')
+  .option('--target-monitor-id <id>', 'Existing Monitor UUID')
+  .option('--expected-scope-version-id <id>', 'Expected Monitor scope version UUID')
+  .option('--focal-brand-id <id>', 'Focal Brand UUID')
+  .option('--monitor-name <name>', 'Focused Monitor name')
+  .option('--topic-mappings <jsonOrFile>', 'Topic mappings JSON array or @file.json')
+  .option('--canonical-input-hash <hash>', 'Canonical activation input hash')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: EXPLORE_CHANNEL_ACTIONS.previewActivation.action }));
+
+addExploreCommandOptions(explore.command('activate'))
+  .description('Activate the exact selected Explore searches')
+  .option('--selection-id <id>', 'Selection UUID')
+  .option('--plan-fingerprint <fingerprint>', 'Server-issued activation plan fingerprint')
+  .option('--bindings <jsonOrFile>', 'Exact activation bindings JSON array or @file.json')
+  .option('--target-monitor-id <id>', 'Existing Monitor UUID')
+  .option('--expected-scope-version-id <id>', 'Expected Monitor scope version UUID')
+  .option('--focal-brand-id <id>', 'Focal Brand UUID')
+  .option('--monitor-name <name>', 'Focused Monitor name')
+  .option('--topic-mappings <jsonOrFile>', 'Topic mappings JSON array or @file.json')
+  .option('--canonical-input-hash <hash>', 'Canonical activation input hash')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'activateSearches' }));
+
+addExploreCommandOptions(explore.command('handoff'))
+  .description('Prepare a server-issued Explore handoff')
+  .option('--selection-id <id>', 'Selection UUID')
+  .option('--destination <destination>', 'home|monitor|study|create|find_creators|seal|deliverable_share')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: 'prepareHandoff' }));
+
+addExploreCommandOptions(explore.command('deliverable'))
+  .description('Create a deliverable from an immutable Explore selection')
+  .option('--selection-id <id>', 'Selection UUID')
+  .option('--idempotency-key <key>', 'Idempotency key')
+  .action((opts) => runCommand(handleExploreCommand, { ...opts, exploreAction: EXPLORE_CHANNEL_ACTIONS.createDeliverable.action }));
+}
 
 const data = program.command('data').description('Data exports (provisional)');
 
@@ -4967,12 +6648,14 @@ const video = program.command('video').description('Tracked video extraction wor
 
 video
   .command('queue-analysis')
-  .description('Queue video analysis for tracked videos or tracked search results')
+  .description('Queue video analysis for tracked videos, tracked search results, or ad hoc public URLs')
+  .option('--url <url>', 'Public TikTok, Instagram, or YouTube video URL (requires --allow-untracked)')
   .option('--video-id <id>', 'Tracked video identifier (video_uid first, then platform video id; not a tracking item id)')
   .option('--search-result-id <id>', 'Tracked search result id for a ranked result row')
   .option('--video-uid <id>', 'Canonical tracked video_uid')
   .option('--platform-video-id <id>', 'Platform-native video id')
   .option('--body <jsonOrFile>', 'JSON body or @payload.json for batch queueing')
+  .option('--allow-untracked', 'Allow ad hoc public URL analysis for videos not already tracked')
   .option('--wait', 'Poll until queued/completing analyses settle')
   .option('--poll-interval <ms>', 'Polling interval in milliseconds when --wait is enabled')
   .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
@@ -4986,12 +6669,14 @@ video
 
 video
   .command('extract')
-  .description('Resolve tracked videos/results into structured analysis plus reference assets')
+  .description('Resolve tracked videos/results or ad hoc public URLs into structured analysis plus reference assets')
+  .option('--url <url>', 'Public TikTok, Instagram, or YouTube video URL (requires --allow-untracked)')
   .option('--video-id <id>', 'Tracked video identifier (video_uid first, then platform video id; not a tracking item id)')
   .option('--search-result-id <id>', 'Tracked search result id for a ranked result row')
   .option('--video-uid <id>', 'Canonical tracked video_uid')
   .option('--platform-video-id <id>', 'Platform-native video id')
   .option('--body <jsonOrFile>', 'JSON body or @payload.json for batch extraction')
+  .option('--allow-untracked', 'Allow ad hoc public URL analysis for videos not already tracked')
   .option('--ensure-analysis', 'Queue analysis when it is missing')
   .option('--wait', 'Poll until queued/completing analyses settle')
   .option('--poll-interval <ms>', 'Polling interval in milliseconds when --wait is enabled')
