@@ -1,5 +1,10 @@
 # SocialSeal CLI
 
+This is the canonical public CLI in
+[OpenSealAI/socialseal-cli](https://github.com/OpenSealAI/socialseal-cli). It
+calls `https://api.socialseal.co`, whose server-side CLI gateway remains in the
+SocialSeal monorepo; this repository contains the client only.
+
 ## Setup
 
 - Requires Node 18+

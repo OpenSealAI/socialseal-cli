@@ -2,12 +2,14 @@
 
 ## Unreleased
 
-- Remove the conversational agent command from the installed CLI and agent execution from MCP discovery; conversational agent workflows remain in the web app.
-
 ## 0.1.14 - 2026-08-30
 
+- Remove the conversational agent command from the installed CLI; conversational
+  agent workflows remain in the web app while the source module stays available
+  for internal compatibility.
 - Ship the first-class Explore command family through the standalone CLI entrypoint, including static discovery/schema metadata, canonical actions and limits, policy-gated registration, polling, and exact selection validation.
-- Remove the unpublished `@socialseal/contracts` runtime dependency so packed installs run independently of the SocialSeal monorepo.
+- Keep the Explore contract dependency-free so packed installs run independently
+  of the SocialSeal monorepo.
 
 ## 0.1.12 - 2026-06-23
 
