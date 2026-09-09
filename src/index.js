@@ -3613,9 +3613,17 @@ async function handlePublicAction(opts) {
   if (opts.mode === 'call') {
     body = parseJsonInput(opts.body, { label: 'body' }) ?? {};
     if (!isJsonObject(body)) throw new Error('Action body must be a JSON object.');
-    // Only an explicitly supplied scope is added here. The shared runtime resolves
-    // read defaults and rejects missing write scope using its authoritative schema.
-    if (opts.workspaceId) body = mergeWorkspaceIdIntoPayload(body, opts.workspaceId);
+    const selection = resolveWorkspaceSelection(opts, config);
+    if (selection.source === 'flag') body = mergeWorkspaceIdIntoPayload(body, selection.workspaceId);
+    else if (!body.workspaceId && selection.workspaceId) {
+      const catalogResponse = await callApi({ apiBase, apiKey, path: '/cli/actions', method: 'GET', timeoutMs });
+      if (!catalogResponse.ok) throw await buildHttpError(catalogResponse, { label: 'Public action catalogue' });
+      const catalog = await catalogResponse.json();
+      const action = catalog.actions?.find((entry) => entry.name === opts.name);
+      // Saved/environment defaults scope reads. Writes still require a body or flag
+      // scope, and the gateway remains responsible for validation and authorization.
+      if (action?.annotations?.readOnlyHint === true) body = mergeWorkspaceIdIntoPayload(body, selection.workspaceId);
+    }
   }
   const res = await callApi({ apiBase, apiKey,
     path: opts.mode === 'call' ? `/cli/actions/${encodeURIComponent(opts.name)}` : '/cli/actions',

@@ -3531,7 +3531,7 @@ test("tools status video_analysis refuses URL polling before any request", () =>
 
 test("actions use the deployed catalogue and preserve exact typed arguments", async () => {
   const requests = [];
-  const catalogue = { catalogVersion: "test-version", actions: [{ name: "socialseal_get_tracking_group", inputSchema: { type: "object", required: ["group_id"] } }] };
+  const catalogue = { catalogVersion: "test-version", actions: [{ name: "socialseal_get_tracking_group", inputSchema: { type: "object", required: ["group_id"] }, annotations: { readOnlyHint: true } }] };
   const httpServer = createServer(async (req, res) => {
     let raw = ""; for await (const chunk of req) raw += chunk;
     requests.push({ url: req.url, method: req.method, body: raw ? JSON.parse(raw) : null });
@@ -3542,13 +3542,52 @@ test("actions use the deployed catalogue and preserve exact typed arguments", as
   try {
     const common = ["--api-base", `http://127.0.0.1:${httpServer.address().port}`, "--api-key", "test"];
     for (const args of [["list"], ["schema", "socialseal_get_tracking_group"], ["call", "socialseal_get_tracking_group", "--body", '{"group_id":436}']]) {
-      const result = await runCliAsync(["actions", ...args, ...common], { env: { SOCIALSEAL_CONFIG: createTempConfig({ workspaceId: "stale-config" }), SOCIALSEAL_WORKSPACE_ID: "" } });
+      const result = await runCliAsync(["actions", ...args, ...common], { env: { SOCIALSEAL_CONFIG: createTempConfig({ workspaceId: "client-A" }), SOCIALSEAL_WORKSPACE_ID: "" } });
       assert.equal(result.status, 0, result.stderr);
       const data = JSON.parse(result.stdout);
       if (args[0] === "call") assert.deepEqual(data, { result: { id: 436, coverage: "partial" } });
       else assert.equal(data.catalogVersion, "test-version");
     }
-    assert.deepEqual(requests.map((request) => request.url), ["/cli/actions", "/cli/actions", "/cli/actions/socialseal_get_tracking_group"]);
-    assert.deepEqual(requests[2].body, { group_id: 436 });
+    assert.deepEqual(requests.map((request) => request.url), ["/cli/actions", "/cli/actions", "/cli/actions", "/cli/actions/socialseal_get_tracking_group"]);
+    assert.deepEqual(requests.at(-1).body, { group_id: 436, workspaceId: "client-A" });
   } finally { await new Promise((resolve) => httpServer.close(resolve)); }
+});
+
+
+test("actions keep local read scope when the server default differs, and require explicit write scope", async () => {
+  const calls = [];
+  const catalogue = { actions: [
+    { name: "read", annotations: { readOnlyHint: true } },
+    { name: "write", annotations: { readOnlyHint: false } },
+  ] };
+  const server = createServer(async (req, res) => {
+    let raw = ""; for await (const chunk of req) raw += chunk;
+    res.setHeader("Content-Type", "application/json");
+    if (req.method === "GET") { res.end(JSON.stringify(catalogue)); return; }
+    const body = JSON.parse(raw); calls.push(body);
+    if (req.url.endsWith("/write") && !body.workspaceId) {
+      res.statusCode = 400; res.end(JSON.stringify({ error: "WORKSPACE_REQUIRED" })); return;
+    }
+    res.end(JSON.stringify({ workspaceId: body.workspaceId || "client-B" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const common = ["--api-base", `http://127.0.0.1:${server.address().port}`, "--api-key", "test"];
+    const config = createTempConfig({ workspaceId: "client-A" });
+    for (const [name, envWorkspace, extra, expected, status] of [
+      ["read", "", [], "client-A", 0],
+      ["read", "client-env", [], "client-env", 0],
+      ["read", "client-env", ["--workspace-id", "client-flag"], "client-flag", 0],
+      ["read", "client-env", ["--body", '{"workspaceId":"client-body"}'], "client-body", 0],
+      ["write", "", [], undefined, 2],
+      ["write", "client-env", [], undefined, 2],
+      ["write", "", ["--workspace-id", "client-flag"], "client-flag", 0],
+      ["write", "", ["--body", '{"workspaceId":"client-body"}'], "client-body", 0],
+    ]) {
+      const result = await runCliAsync(["actions", "call", name, ...extra, ...common], { env: { SOCIALSEAL_CONFIG: config, SOCIALSEAL_WORKSPACE_ID: envWorkspace } });
+      assert.equal(result.status, status, result.stderr);
+      assert.equal(calls.at(-1).workspaceId, expected);
+      if (status === 0) assert.equal(JSON.parse(result.stdout).workspaceId, expected);
+    }
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
