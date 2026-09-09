@@ -44,7 +44,24 @@ Optional config file:
   - `socialseal tools list --json`
   - `socialseal tools schema --function search-journey-run`
 
-- Tools (direct edge function call):
+- Named-account evidence (no persistent tracking):
+  - `socialseal creator profile https://www.instagram.com/clubbradshaw/ --platform instagram`
+  - `socialseal creator recent-posts @clubbradshaw --platform instagram --count 5 --workspace-id <uuid>`
+  - Optional `--brand-id <uuid>` narrows accessible brand context. Missing brand context does not prevent account metrics.
+  - Results preserve publication provenance, mixed media, coverage, metric denominators, and unavailable values. They are stored snapshots, not guaranteed current or complete account timelines. `--freshness fresh` returns `FRESH_COLLECTION_REQUIRED` with useful stored evidence. Use the separate collection command for an authorized fresh snapshot; the provider does not support timeline pagination, so even fresh results may have partial coverage.
+
+- One-off account collection (existing one-account-refresh credit policy):
+  - `socialseal creator collect @clubbradshaw --workspace-id <uuid> --idempotency-key <key> --max-credits 1 --wait --json`
+  - `socialseal creator status <collection-id> --workspace-id <uuid> --json`
+  - Reuse the same key after timeouts. A terminal failed receipt does not restart collection. No ongoing tracker is created.
+
+- Released actions (live shared MCP catalogue and schema):
+  - `socialseal actions list --json`
+  - `socialseal actions schema socialseal_get_tracking_group --json`
+  - `socialseal actions call socialseal_get_tracking_group --body '{"group_id":436}' --json`
+  - Pass `--workspace-id` for writes or include `workspaceId` in the arguments. Read defaults are resolved by the shared runtime. Requires the corresponding gateway/backend deployment; the package alone does not release new operations.
+
+- Tools (compatibility backend access):
   - `socialseal tools call --function <tool> --body @payload.json --api-base https://api.socialseal.co --api-key <key>`
   - `socialseal tools call --function <tool> --body @payload.json --json`
   - `socialseal tools call --function search-journey-run --body @payload.json --async --workspace-id <uuid>`
@@ -52,6 +69,7 @@ Optional config file:
   - `socialseal tools status 6809 --kind google_ai_run`
   - `socialseal tools status <job-uuid> --kind agent_job`
   - `socialseal tools status <run-uuid> --kind journey_run --workspace-id <uuid>`
+  - `socialseal tools status <returned-video-id> --kind video_analysis --workspace-id <uuid> --include-results --wait`
   - `socialseal tools status 6809 --kind google_ai_run --wait --include-results`
 
 - Tracked video extraction:
@@ -111,3 +129,13 @@ Optional config file:
 
 ## Maintainers
 - The public CLI base (`api.socialseal.co`) must route to the CLI gateway service.
+
+## Direct-action interoperability
+
+The creator commands forward `creator-account-read` actions `profile` and `recent_posts` with `target`, `platform`, `recentPostCount`, `freshness`, and optional brand/workspace context. The backend validates the canonical request and calculates the metrics; the CLI does not recompute them. These are the same operations exposed by MCP's `socialseal_get_creator_profile` and `socialseal_get_creator_recent_posts`.
+
+The retained `tools call` command supports other released backend operations and existing scripts. A semantic resolver, skill, or tracking-group setup is not a prerequisite. The built-in `tools list`/`tools schema` hints are package snapshots, not an authoritative release or permission decision; the backend applies release, authentication, cost, and scope checks.
+
+For an export artifact that needs in-session reading, pass its `read_token` in a body file to `tools call --function export-artifact-read --body @read.json`, using `{ "t": "<read-token>", "offset": 0, "limit": 200 }`. Continue using the returned `next_offset` until `has_more` is false. Preserve historical coverage and partial results. A generated URL alone does not establish that all rows have been read.
+
+Video-analysis status uses only the returned `videoUid` or `platformVideoId` and a read-only backend action. URL polling is rejected because it could repeat provider work. New analysis still uses the existing backend admission and cost boundary.

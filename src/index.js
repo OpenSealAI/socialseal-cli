@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import WebSocket from 'ws';
+import { CREATOR_ACCOUNT_CONTRACT_VERSION, CREATOR_COLLECTION_CONTRACT_VERSION, CREATOR_ACCOUNT_DEFAULT_POST_COUNT, CREATOR_ACCOUNT_REFRESH_CREDITS, CREATOR_ACCOUNT_OPERATIONS, CREATOR_ACCOUNT_EVIDENCE_SEMANTICS } from './contracts/creator-account.mjs';
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config', 'socialseal', 'config.json');
 const DEFAULT_API_BASE = 'https://api.socialseal.co';
@@ -30,7 +31,7 @@ const EXIT_CODES = {
 };
 const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const ACTIVE_STATUS_VALUES = new Set(['queued', 'pending', 'processing', 'in_progress', 'running']);
-const TOOL_STATUS_KINDS = new Set(['auto', 'agent_job', 'google_ai_run', 'journey_run']);
+const TOOL_STATUS_KINDS = new Set(['auto', 'agent_job', 'google_ai_run', 'journey_run', 'video_analysis']);
 const REPORT_TYPE_SEARCH_RESULTS_ENRICHED = 'search_results_enriched';
 const EXPORT_DATA_TEMPLATE_TRACKING_RANKED_VIDEOS_RAW = 'tracking_ranked_videos_raw';
 const EXPORT_DATA_TEMPLATE_GOOGLE_AI_SEARCH_SUMMARIES_RAW = 'google_ai_search_summaries_raw';
@@ -80,6 +81,14 @@ const EXPORT_OPTIONS = [
   },
 ];
 const KNOWN_TOOLS = [
+  ...['creator-account-read', 'creator-account-collect'].map((name) => ({
+    name, category: 'creator', workspaceScoped: true,
+    description: name === 'creator-account-read'
+      ? 'Read a named Instagram profile and recent account timeline posts with explicit metrics, freshness, coverage and brand context.'
+      : 'Collect one named Instagram account snapshot with existing refresh billing and durable idempotency, or read its status. No tracker.',
+    actionAliases: CREATOR_ACCOUNT_OPERATIONS.filter((operation) => operation.backend === name).map((operation) => operation.action),
+    notes: CREATOR_ACCOUNT_EVIDENCE_SEMANTICS.collection,
+  })),
   {
     name: 'agent-tool-jobs',
     category: 'agent',
@@ -231,6 +240,17 @@ const KNOWN_TOOLS = [
 ];
 
 const TOOL_SCHEMA_HINTS = {
+  ...Object.fromEntries(['creator-account-read', 'creator-account-collect'].map((name) => [name, {
+    summary: CREATOR_ACCOUNT_EVIDENCE_SEMANTICS.collection,
+    operations: CREATOR_ACCOUNT_OPERATIONS.filter((operation) => operation.backend === name).map((operation) => ({
+      action: operation.action, required: operation.required, optional: operation.optional,
+      example: operation.action === 'status'
+        ? { action: 'status', workspaceId: '<workspace-id>', id: '<collection-id>' }
+        : { action: operation.action, target: 'https://www.instagram.com/clubbradshaw/', platform: 'instagram', recentPostCount: 5,
+          ...(operation.action === 'start' ? { workspaceId: '<workspace-id>', idempotencyKey: 'creator-review-1', maxCredits: 1 } : {}) },
+    })),
+    cliExamples: ['socialseal creator recent-posts https://www.instagram.com/clubbradshaw/ --count 5 --json', 'socialseal creator collect @clubbradshaw --workspace-id <workspace-id> --idempotency-key <key> --max-credits 1 --wait --json', 'socialseal creator status <collection-id> --workspace-id <workspace-id> --json'],
+  }])),
   'agent-tool-jobs': {
     summary: 'Queue agent-backed jobs and read UUID job status.',
     operations: [
@@ -1028,7 +1048,7 @@ function isPositiveIntegerString(value) {
   return typeof value === 'string' && /^[1-9]\d*$/.test(value.trim());
 }
 
-function normalizeStatusIdentifier(rawId) {
+function normalizeStatusIdentifier(rawId, kind = 'auto') {
   const id = trimString(rawId);
   if (!id) {
     throw new CliError('Missing status identifier.', {
@@ -1036,6 +1056,15 @@ function normalizeStatusIdentifier(rawId) {
       exitCode: EXIT_CODES.USAGE,
       hint: 'Pass a numeric Google AI runId or a UUID job/run id.',
     });
+  }
+
+  if (kind === 'video_analysis') {
+    if (/^https?:\/\//i.test(id)) {
+      throw new CliError('Poll using the returned videoUid or platformVideoId; a URL can repeat provider work.', {
+        code: 'INVALID_ARGUMENT', exitCode: EXIT_CODES.USAGE,
+      });
+    }
+    return { rawId: id, numericId: null, uuidId: isUuidLike(id) ? id : null };
   }
 
   if (isPositiveIntegerString(id)) {
@@ -1064,7 +1093,7 @@ function parseToolStatusKind(rawKind) {
   throw new CliError(`Unsupported tools status kind: ${rawKind}`, {
     code: 'INVALID_ARGUMENT',
     exitCode: EXIT_CODES.USAGE,
-    hint: 'Use --kind auto|agent_job|google_ai_run|journey_run.',
+    hint: 'Use --kind auto|agent_job|google_ai_run|journey_run|video_analysis.',
   });
 }
 
@@ -2855,6 +2884,36 @@ async function resolveUnifiedToolStatus({
   includeResults,
   resultsLimit,
 }) {
+  if (kind === 'video_analysis') {
+    requireWorkspaceSelection(workspaceId, {
+      label: 'video_analysis status',
+      hint: 'Reuse the workspace returned by the analysis start.',
+    });
+    const item = identifier.uuidId
+      ? { videoUid: identifier.uuidId }
+      : { platformVideoId: identifier.rawId };
+    const response = await callToolJson({
+      apiBase, apiKey, useGateway, legacyUrl, timeoutMs, workspaceId,
+      functionName: 'tracked-video-extract',
+      body: {
+        action: 'status', items: [item], ensureAnalysis: false,
+        includeAssets: false, includeRawAnalysis: includeResults, includeSourceVideo: false,
+      },
+      label: 'Video analysis status',
+    });
+    if (response.notFound) {
+      throw new CliError(`Video analysis not found: ${identifier.rawId}`, {
+        code: 'STATUS_NOT_FOUND', exitCode: EXIT_CODES.NOT_FOUND,
+      });
+    }
+    const result = Array.isArray(response.data?.results) ? response.data.results[0] ?? null : null;
+    return {
+      kind: 'video_analysis', id: identifier.rawId, workspaceId,
+      status: trimString(result?.status || result?.analysis?.normalizedStatus || result?.analysis?.status) || 'unknown',
+      result, raw: response.data,
+    };
+  }
+
   if (kind === 'google_ai_run') {
     if (identifier.numericId == null) {
       throw new CliError('google_ai_run status expects a numeric run id.', {
@@ -2963,6 +3022,9 @@ function buildStatusCommandHint(result, workspaceId) {
   }
   if (result.kind === 'agent_tool_job') {
     return `socialseal tools status ${result.id} --kind agent_job`;
+  }
+  if (result.kind === 'video_analysis') {
+    return `socialseal tools status ${result.id} --kind video_analysis --workspace-id ${workspaceId || result.workspaceId}`;
   }
   if (result.kind === 'search_journey_run') {
     const scopedWorkspace = workspaceId || result.workspaceId;
@@ -3542,6 +3604,99 @@ async function handleAgentRun(opts) {
   });
 }
 
+async function handlePublicAction(opts) {
+  const config = loadConfig();
+  const apiBase = resolveApiBase(opts, config);
+  const apiKey = requireApiKey(opts, config);
+  const timeoutMs = resolveTimeoutMs(opts, config);
+  let body;
+  if (opts.mode === 'call') {
+    body = parseJsonInput(opts.body, { label: 'body' }) ?? {};
+    if (!isJsonObject(body)) throw new Error('Action body must be a JSON object.');
+    const selection = resolveWorkspaceSelection(opts, config);
+    if (selection.source === 'flag') body = mergeWorkspaceIdIntoPayload(body, selection.workspaceId);
+    else if (!body.workspaceId && selection.workspaceId) {
+      const catalogResponse = await callApi({ apiBase, apiKey, path: '/cli/actions', method: 'GET', timeoutMs });
+      if (!catalogResponse.ok) throw await buildHttpError(catalogResponse, { label: 'Public action catalogue' });
+      const catalog = await catalogResponse.json();
+      const action = catalog.actions?.find((entry) => entry.name === opts.name);
+      // Saved/environment defaults scope reads. Writes still require a body or flag
+      // scope, and the gateway remains responsible for validation and authorization.
+      if (action?.annotations?.readOnlyHint === true) body = mergeWorkspaceIdIntoPayload(body, selection.workspaceId);
+    }
+  }
+  const res = await callApi({ apiBase, apiKey,
+    path: opts.mode === 'call' ? `/cli/actions/${encodeURIComponent(opts.name)}` : '/cli/actions',
+    method: opts.mode === 'call' ? 'POST' : 'GET', body, timeoutMs,
+  });
+  if (!res.ok) throw await buildHttpError(res, { label: 'Public action' });
+  const data = await res.json();
+  if (opts.mode === 'schema') {
+    const action = data.actions?.find((entry) => entry.name === opts.name);
+    if (!action) throw new Error(`Unsupported released public action: ${opts.name}`);
+    emitJsonOutput({ catalogVersion: data.catalogVersion, ...action }, opts.pretty);
+  } else emitJsonOutput(data, opts.pretty);
+}
+
+async function handleCreatorOperation(opts) {
+  const operation = CREATOR_ACCOUNT_OPERATIONS.find((entry) => entry.cliCommand === opts.creatorCommand);
+  const config = loadConfig();
+  const apiKey = requireApiKey(opts, config);
+  const apiBase = resolveApiBase(opts, config);
+  const supabaseUrl = resolveLegacyUrl(resolveSupabaseUrl(opts, config), 'SOCIALSEAL_SUPABASE_URL');
+  const { resolvedApiBase, legacyUrl, useGateway } = resolveApiTarget({ apiBase, legacyUrl: supabaseUrl });
+  const timeoutMs = resolveTimeoutMs(opts, config);
+  const { workspaceId } = resolveWorkspaceSelection(opts, config);
+  const recentPostCount = Number(opts.count);
+  if (!Number.isSafeInteger(recentPostCount) || recentPostCount < 1) {
+    throw new CliError('--count must be a positive integer.', { code: 'INVALID_ARGUMENT', exitCode: EXIT_CODES.USAGE });
+  }
+  if (opts.platform !== 'instagram') {
+    throw new CliError('Named-account evidence currently supports platform=instagram.', { code: 'UNSUPPORTED_PLATFORM', exitCode: EXIT_CODES.USAGE });
+  }
+  if (operation.action === 'start' && Number(opts.maxCredits) !== CREATOR_ACCOUNT_REFRESH_CREDITS) {
+    throw new CliError('--max-credits must be 1 for the existing one-account-refresh monitoring credit budget.', { code: 'INVALID_ARGUMENT', exitCode: EXIT_CODES.USAGE });
+  }
+  if (opts.freshness && !['stored', 'fresh'].includes(opts.freshness)) {
+    throw new CliError('--freshness must be stored or fresh.', { code: 'INVALID_ARGUMENT', exitCode: EXIT_CODES.USAGE });
+  }
+  const scope = { ...(workspaceId ? { workspaceId } : {}), recentPostCount, ...(opts.brandId ? { brandId: opts.brandId } : {}) };
+  const body = operation.action === 'status' ? { ...scope, action: 'status', id: opts.id }
+    : { ...scope, action: operation.action, target: opts.target, platform: opts.platform,
+      ...(operation.action === 'start'
+        ? { idempotencyKey: opts.idempotencyKey, maxCredits: CREATOR_ACCOUNT_REFRESH_CREDITS }
+        : { freshness: opts.freshness ?? 'stored' }) };
+  const call = async (payload, remainingMs) => {
+    const result = await callToolJson({ apiBase: resolvedApiBase, apiKey, useGateway, legacyUrl,
+      functionName: operation.backend, body: payload, workspaceId, timeoutMs: remainingMs, label: 'Named creator evidence' });
+    if (result.notFound) throw new CliError('Named creator operation or collection receipt is unavailable on this backend.', { code: 'NOT_FOUND', exitCode: EXIT_CODES.NOT_FOUND });
+    const expected = operation.backend === 'creator-account-read' ? CREATOR_ACCOUNT_CONTRACT_VERSION : CREATOR_COLLECTION_CONTRACT_VERSION;
+    if (!isJsonObject(result.data) || result.data.schemaVersion !== expected) {
+      throw new CliError('Named creator operation returned an unsupported evidence schema.', { code: 'INVALID_RESPONSE', exitCode: EXIT_CODES.SERVER });
+    }
+    return result.data;
+  };
+  const deadline = Date.now() + timeoutMs;
+  let result = await call(body, timeoutMs);
+  if (opts.wait && operation.backend === 'creator-account-collect') {
+    const intervalMs = resolvePollIntervalMs(opts);
+    while (result.status === 'running') {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        // Keep the receipt and completed portions reviewable after a local wait timeout.
+        emitJsonOutput(result, opts.pretty);
+        throw new CliError('Creator collection is still running; use creator status with its id or retry collect with the same idempotency key.', { code: 'TIMEOUT', exitCode: EXIT_CODES.SERVER });
+      }
+      await sleep(Math.min(intervalMs, remainingMs));
+      const requestMs = deadline - Date.now();
+      if (requestMs <= 0) continue;
+      result = await call({ ...scope, action: 'status', id: result.id }, requestMs);
+    }
+  }
+  emitJsonOutput(result, opts.pretty);
+  if (result.status === 'failed') process.exitCode = EXIT_CODES.SERVER;
+}
+
 async function handleToolsCall(opts) {
   const config = loadConfig();
   const apiKey = requireApiKey(opts, config);
@@ -3852,7 +4007,7 @@ async function handleToolsStatus(opts) {
   const includeResults = opts.includeResults === true;
   const resultsLimit = resolveStatusResultsLimit(opts.resultsLimit);
   const kind = parseToolStatusKind(opts.kind);
-  const identifier = normalizeStatusIdentifier(opts.id);
+  const identifier = normalizeStatusIdentifier(opts.id, kind);
   const { workspaceId } = resolveWorkspaceSelection(opts, config);
 
   const loadStatus = async () =>
@@ -4814,7 +4969,22 @@ workspace
   .option('--verbose', 'Show error details')
   .action((opts) => runCommand(handleWorkspaceClear, opts));
 
-const tools = program.command('tools').description('Call edge functions directly (tool backends)');
+const actions = program.command('actions').description('Discover and call released actions using the live MCP catalogue');
+for (const mode of ['list', 'schema', 'call']) {
+  const command = actions.command(mode === 'list' ? 'list' : `${mode} <name>`)
+    .description(mode === 'list' ? 'Read the deployed public action catalogue' : mode === 'schema' ? 'Read the deployed action schema' : 'Execute a typed public action')
+    .option('--api-base <url>', 'API base URL')
+    .option('--api-key <key>', 'CLI API key')
+    .option('--json', 'Emit machine-readable errors')
+    .option('--pretty', 'Pretty-print JSON')
+    .option('--timeout <ms>', 'Request timeout in milliseconds')
+    .option('--verbose', 'Show error details');
+  if (mode === 'call') command.option('--body <jsonOrFile>', 'Typed action arguments or @file.json').option('--workspace-id <id>', 'Explicit workspace scope');
+  if (mode === 'list') command.action((opts) => runCommand(handlePublicAction, { ...opts, mode }));
+  else command.action((name, opts) => runCommand(handlePublicAction, { ...opts, mode, name }));
+}
+
+const tools = program.command('tools').description('Compatibility access to backend functions; prefer actions for released operations');
 
 tools
   .command('list')
@@ -4852,11 +5022,11 @@ tools
 
 tools
   .command('status <id>')
-  .description('Read unified status for UUID jobs, journey run UUIDs, or numeric Google AI run ids')
-  .option('--kind <kind>', 'auto|agent_job|google_ai_run|journey_run', 'auto')
+  .description('Read status for jobs, journey runs, Google AI runs, or video analysis')
+  .option('--kind <kind>', 'auto|agent_job|google_ai_run|journey_run|video_analysis', 'auto')
   .option('--wait', 'Poll until status reaches a terminal state')
   .option('--poll-interval <ms>', 'Polling interval in milliseconds when --wait is enabled')
-  .option('--include-results', 'Include Google AI summary/citation rows when reading numeric run ids')
+  .option('--include-results', 'Include Google AI results or stored raw video analysis')
   .option('--results-limit <n>', 'Max Google AI summary rows to include when --include-results is set')
   .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
   .option('--api-key <key>', 'CLI API key')
@@ -4866,6 +5036,37 @@ tools
   .option('--timeout <ms>', 'Request timeout in milliseconds')
   .option('--verbose', 'Show error details')
   .action((id, opts) => runCommand(handleToolsStatus, { ...opts, id }));
+
+const creator = program.command('creator').description('Named-account profile, recent-post metrics and one-off collection');
+for (const operation of CREATOR_ACCOUNT_OPERATIONS) {
+  const command = creator.command(`${operation.cliCommand} <${operation.action === 'status' ? 'id' : 'target'}>`)
+    .description(operation.title)
+    .option('--platform <platform>', 'Supported account platform', 'instagram')
+    .option('--count <n>', 'Requested recent account posts, including images, carousels and videos', String(CREATOR_ACCOUNT_DEFAULT_POST_COUNT))
+    .option('--brand-id <id>', 'Existing accessible workspace brand for fit context')
+    .option('--api-base <url>', 'API base URL (default https://api.socialseal.co)')
+    .option('--api-key <key>', 'CLI API key')
+    .option('--pretty', 'Pretty-print JSON')
+    .option('--json', 'Emit machine-readable errors')
+    .option('--timeout <ms>', 'Request/wait timeout in milliseconds')
+    .option('--verbose', 'Show error details');
+  if (operation.backend === 'creator-account-collect') {
+    command.requiredOption('--workspace-id <id>', 'Explicit workspace for the collection receipt')
+      .option('--wait', 'Poll running receipt until terminal; does not retry failed collections')
+      .option('--poll-interval <ms>', 'Polling interval in milliseconds');
+  } else {
+    command.option('--workspace-id <id>', 'Accessible workspace; otherwise configured/backend default')
+      .option('--freshness <mode>', 'stored|fresh; fresh reads return collection guidance without collecting', 'stored');
+  }
+  if (operation.action === 'start') {
+    command.requiredOption('--idempotency-key <key>', 'Reuse after timeouts/retries to avoid duplicate collection and charges')
+      .requiredOption('--max-credits <n>', 'Explicit budget: 1 monitoring credit for one account refresh; no tracker');
+  }
+  command.action((targetOrId, opts) => runCommand(handleCreatorOperation, {
+    ...opts, creatorCommand: operation.cliCommand,
+    ...(operation.action === 'status' ? { id: targetOrId } : { target: targetOrId }),
+  }));
+}
 
 const data = program.command('data').description('Data exports (provisional)');
 
