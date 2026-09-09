@@ -3484,3 +3484,71 @@ test("agent run uses the configured default workspace when no --workspace-id fla
     await new Promise((resolve) => httpServer.close(resolve));
   }
 });
+
+test("tools status video_analysis reads by returned ID without collection side effects", async () => {
+  const requests = [];
+  const evidence = { status: "completed", analysis: { normalizedStatus: "completed", raw: { summary: "Stored analysis" } } };
+  const httpServer = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ method: req.method, url: req.url, body: JSON.parse(body), workspace: req.headers["x-workspace-id"] });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ results: [evidence] }));
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const result = await runCliAsync([
+      "tools", "status", "IG-shortcode", "--kind", "video_analysis", "--include-results",
+      "--workspace-id", "workspace-video", "--api-key", "test",
+      "--api-base", `http://127.0.0.1:${httpServer.address().port}`, "--json",
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.kind, "video_analysis");
+    assert.equal(payload.status, "completed");
+    assert.deepEqual(payload.result, evidence);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "/cli/tools/tracked-video-extract");
+    assert.equal(requests[0].workspace, "workspace-video");
+    assert.deepEqual(requests[0].body, {
+      action: "status", items: [{ platformVideoId: "IG-shortcode" }],
+      ensureAnalysis: false, includeAssets: false, includeRawAnalysis: true, includeSourceVideo: false,
+    });
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+  }
+});
+
+test("tools status video_analysis refuses URL polling before any request", () => {
+  const result = runCli([
+    "tools", "status", "https://www.instagram.com/reel/example/", "--kind", "video_analysis",
+    "--workspace-id", "workspace-video", "--api-key", "test", "--json",
+  ]);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /returned.*videoUid|videoUid.*returned/i);
+});
+
+
+test("actions use the deployed catalogue and preserve exact typed arguments", async () => {
+  const requests = [];
+  const catalogue = { catalogVersion: "test-version", actions: [{ name: "socialseal_get_tracking_group", inputSchema: { type: "object", required: ["group_id"] } }] };
+  const httpServer = createServer(async (req, res) => {
+    let raw = ""; for await (const chunk of req) raw += chunk;
+    requests.push({ url: req.url, method: req.method, body: raw ? JSON.parse(raw) : null });
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify(req.method === "GET" ? catalogue : { result: { id: 436, coverage: "partial" } }));
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const common = ["--api-base", `http://127.0.0.1:${httpServer.address().port}`, "--api-key", "test"];
+    for (const args of [["list"], ["schema", "socialseal_get_tracking_group"], ["call", "socialseal_get_tracking_group", "--body", '{"group_id":436}']]) {
+      const result = await runCliAsync(["actions", ...args, ...common], { env: { SOCIALSEAL_CONFIG: createTempConfig({ workspaceId: "stale-config" }), SOCIALSEAL_WORKSPACE_ID: "" } });
+      assert.equal(result.status, 0, result.stderr);
+      const data = JSON.parse(result.stdout);
+      if (args[0] === "call") assert.deepEqual(data, { result: { id: 436, coverage: "partial" } });
+      else assert.equal(data.catalogVersion, "test-version");
+    }
+    assert.deepEqual(requests.map((request) => request.url), ["/cli/actions", "/cli/actions", "/cli/actions/socialseal_get_tracking_group"]);
+    assert.deepEqual(requests[2].body, { group_id: 436 });
+  } finally { await new Promise((resolve) => httpServer.close(resolve)); }
+});
