@@ -786,7 +786,7 @@ test("tools call translates tracking action=refresh into POST /tracking/:id/refr
   }
 });
 
-test("tools call translates tracking action=create into POST /tracking with workspace_id query scope", async () => {
+test("tools call translates tracking action=create into canonical search activation with workspace scope", async () => {
   let requestMethod = null;
   let requestUrl = null;
   let requestWorkspaceHeader = null;
@@ -805,8 +805,7 @@ test("tools call translates tracking action=create into POST /tracking with work
     const parsedUrl = new URL(req.url, "http://127.0.0.1");
     if (
       req.method === "POST" &&
-      parsedUrl.pathname === "/cli/tools/tracking" &&
-      parsedUrl.searchParams.get("workspace_id") === "workspace-1"
+      parsedUrl.pathname === "/cli/tools/search-activation"
     ) {
       res.writeHead(201, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ id: 27926, workspace_id: "workspace-1" }));
@@ -839,9 +838,11 @@ test("tools call translates tracking action=create into POST /tracking with work
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(requestMethod, "POST");
-    assert.equal(requestUrl, "/cli/tools/tracking?workspace_id=workspace-1");
+    assert.equal(requestUrl, "/cli/tools/search-activation");
     assert.equal(requestWorkspaceHeader, "workspace-1");
     assert.deepEqual(requestBody, {
+      action: "activate",
+      workspaceId: "workspace-1",
       name: "daily commute miles earning",
       track_type: "search",
       track_value: "daily commute miles earning",
@@ -2568,7 +2569,7 @@ test("tools call warns when tracking create runs without a workspace", async () 
   let requestBody = null;
 
   const httpServer = createServer(async (req, res) => {
-    if (req.method === "POST" && req.url === "/cli/tools/tracking") {
+    if (req.method === "POST" && req.url === "/cli/tools/search-activation") {
       requestUrl = req.url;
       requestWorkspaceHeader = req.headers["x-workspace-id"] || null;
       let body = "";
@@ -2605,9 +2606,11 @@ test("tools call warns when tracking create runs without a workspace", async () 
     ]);
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    assert.equal(requestUrl, "/cli/tools/tracking");
+    assert.equal(requestUrl, "/cli/tools/search-activation");
     assert.equal(requestWorkspaceHeader, null);
     assert.deepEqual(requestBody, {
+      action: "activate",
+      workspaceId: null,
       name: "daily commute miles earning",
       track_type: "search",
       track_value: "daily commute miles earning",

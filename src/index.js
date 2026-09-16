@@ -209,7 +209,7 @@ const KNOWN_TOOLS = [
     transport: 'rest_edge_function',
     workspaceScoped: true,
     knownLocalDevState: 'enabled',
-    actionAliases: ['list', 'get', 'resolve', 'get_by_value', 'create', 'update', 'delete', 'refresh'],
+    actionAliases: ['list', 'get', 'resolve', 'get_by_value', 'create', 'update', 'delete', 'refresh', 'preview', 'execute', 'list_topics'],
     notes: 'REST-style surface. `resolve`/`get_by_value` uses the same workspace/platform/region duplicate-detection lookup as create and returns inactive matches too.',
   },
   { name: 'journey-feedback', category: 'vnext', description: 'Record acceptance or rejection feedback for opportunity bundles.' },
@@ -1435,6 +1435,37 @@ function normalizeTrackingType(value) {
   });
 }
 
+// Preserve the server-owned Topic command and execution envelope without interpreting it.
+function searchActivationFields(payload) {
+  const aliases = {
+    topicMode: ['topicMode', 'topic_mode'], allowCreateTopics: ['allowCreateTopics', 'allow_create_topics'],
+    topicDefinitions: ['topicDefinitions', 'topic_definitions'], topicRefs: ['topicRefs', 'topic_refs'],
+    idempotencyKey: ['idempotencyKey', 'idempotency_key'], planFingerprint: ['planFingerprint', 'plan_fingerprint'],
+    previewOnly: ['previewOnly', 'preview_only'], command: ['command'], items: ['items'], language: ['language'],
+  };
+  return Object.fromEntries(Object.entries(aliases).map(([key, names]) => [key, firstDefined(payload, names)]));
+}
+
+function isSearchActivationPayload(payload) {
+  if (payload.item_id || payload.itemId) return false;
+  const type = firstDefined(payload, ['track_type', 'trackType', 'type']);
+  if (type && !['keyword', 'search'].includes(type)) return false;
+  if (Array.isArray(payload.items)) return payload.items.some(item =>
+    typeof item === 'string' ? true : isJsonObject(item) && isSearchActivationPayload({ ...payload, ...item, items: undefined }));
+  return Boolean(payload.command || payload.topicMode || payload.topicDefinitions || firstDefined(payload, ['value', 'track_value', 'term']));
+}
+
+function translateSearchActivation(payload, workspaceId, action, targetGroupId) {
+  if ((Array.isArray(payload.item_ids) && payload.item_ids.length) ||
+    payload.items?.some(item => isJsonObject(item) && (item.item_id || item.itemId))) {
+    throw new CliError('Cannot mix existing item IDs and search values in one activation.', { code: 'INVALID_ARGUMENT', exitCode: EXIT_CODES.USAGE });
+  }
+  return {
+    targetToolName: 'search-activation', method: 'POST', pathSuffix: '', workspaceId,
+    body: stripUndefinedEntries({ ...payload, action, workspaceId, targetGroupId }),
+  };
+}
+
 function normalizeTrackingPayload(payload, fallbackWorkspaceId) {
   const trackValue = firstDefined(payload, ['track_value', 'trackValue', 'value']);
   const refreshFrequency = firstDefined(payload, ['refresh_frequency', 'refreshFrequency']);
@@ -1450,6 +1481,7 @@ function normalizeTrackingPayload(payload, fallbackWorkspaceId) {
   const itemId = firstDefined(payload, ['item_id', 'itemId', 'id']);
 
   return stripUndefinedEntries({
+    ...searchActivationFields(payload),
     action: trimString(firstDefined(payload, ['action'])) || undefined,
     workspaceId: resolvePayloadWorkspaceId(payload, fallbackWorkspaceId),
     item_id: coercePositiveInteger(itemId, 'item_id'),
@@ -1479,6 +1511,7 @@ function normalizeGroupManagementPayload(payload, fallbackWorkspaceId) {
   const page = firstDefined(payload, ['page']);
   const force = firstDefined(payload, ['force']);
   return stripUndefinedEntries({
+    ...searchActivationFields(payload),
     action: trimString(firstDefined(payload, ['action'])) || undefined,
     workspaceId: resolvePayloadWorkspaceId(payload, fallbackWorkspaceId),
     group_id: coercePositiveInteger(groupId, 'group_id'),
@@ -1669,6 +1702,14 @@ function buildBulkGroupAddBody(payload) {
 
 function translateTrackingAction(payload, workspaceId) {
   const action = payload.action ? payload.action.toLowerCase() : null;
+  if (['preview', 'item_preview', 'execute', 'item_execute', 'list_topics', 'topics'].includes(action)) {
+    return translateSearchActivation(payload, workspaceId,
+      ['list_topics', 'topics'].includes(action) ? 'listTopics' : action.replace('item_', ''));
+  }
+  if ((!action || ['create', 'item_create', 'activate'].includes(action)) && isSearchActivationPayload(payload)) {
+    return translateSearchActivation(payload, workspaceId, payload.previewOnly ? 'preview' : payload.planFingerprint ? 'execute' : 'activate');
+  }
+
   if (!action) {
     return {
       method: 'POST',
@@ -1827,6 +1868,11 @@ function translateTrackingAction(payload, workspaceId) {
 
 function translateGroupManagementAction(payload, workspaceId, originalMethod) {
   const action = payload.action ? payload.action.toLowerCase() : null;
+  if (['add_item', 'group_add_item', 'add_items', 'group_add_items'].includes(action) && isSearchActivationPayload(payload)) {
+    if (!payload.group_id) throw new CliError('group_id is required.', { code: 'MISSING_ARGUMENT', exitCode: EXIT_CODES.USAGE });
+    return translateSearchActivation(payload, workspaceId, payload.previewOnly ? 'preview' : payload.planFingerprint ? 'execute' : 'activate', payload.group_id);
+  }
+
 
   if (!action && originalMethod === 'GET') {
     return {
@@ -2628,7 +2674,9 @@ async function buildHttpError(res, context = {}) {
   const hint = context.hint || buildStatusHint(status, context);
 
   return new CliError(`${label} failed: ${status}${statusText}`.trim(), {
-    code: 'HTTP_ERROR',
+    code: context.functionName === 'search-activation' && isJsonObject(details)
+      ? ([details.code, details.error].find(code => typeof code === 'string' && (code.startsWith('SEARCH_ACTIVATION_') || ['TOPIC_INPUT_REQUIRED', 'FORBIDDEN', 'INVALID_REQUEST', 'INSUFFICIENT_CREDITS'].includes(code))) ?? 'HTTP_ERROR')
+      : 'HTTP_ERROR',
     exitCode: mapStatusToExitCode(status),
     status,
     hint,
@@ -3728,8 +3776,8 @@ async function handleToolsCall(opts) {
       ? 'body'
       : (payloadWorkspaceId && payloadWorkspaceId !== resolvedWorkspaceId ? 'body' : workspaceSource);
   const path = useGateway
-    ? `/cli/tools/${opts.function}${translated.pathSuffix || ''}`
-    : `/functions/v1/${opts.function}${translated.pathSuffix || ''}`;
+    ? `/cli/tools/${translated.targetToolName ?? opts.function}${translated.pathSuffix || ''}`
+    : `/functions/v1/${translated.targetToolName ?? opts.function}${translated.pathSuffix || ''}`;
 
   if (opts.function === 'group-management') {
     requireWorkspaceSelection(effectiveWorkspaceId, {
@@ -3804,7 +3852,7 @@ async function handleToolsCall(opts) {
   if (!res.ok) {
     throw await buildHttpError(res, {
       label: 'Tool call',
-      functionName: opts.function,
+      functionName: translated.targetToolName ?? opts.function,
       method,
     });
   }
@@ -3814,7 +3862,7 @@ async function handleToolsCall(opts) {
     const data = await res.json();
     const shouldPoll = shouldHandleSearchJourneyRunAsync(opts.function, method, payload, opts) && opts.poll !== false;
     if (!shouldPoll) {
-      if (isGroupManagementBulkAddInvocation(opts.function, translated)) {
+      if (!translated.targetToolName && isGroupManagementBulkAddInvocation(opts.function, translated)) {
         maybeThrowGroupManagementBulkAddPartialFailure(data, translated);
       }
       maybeEmitFollowupStatusHint({
