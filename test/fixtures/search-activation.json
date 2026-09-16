@@ -1,0 +1,94 @@
+{
+  "workspaceId": "18700000-0000-4000-8000-000000000001",
+  "actorId": "18700000-0000-4000-8000-000000000002",
+  "existingTopicId": "18700000-0000-4000-8000-000000000003",
+  "explicitCreate": {
+    "topicMode": "explicit",
+    "topicDefinitions": [
+      {
+        "kind": "create",
+        "ref": "remote-work",
+        "name": "Remote work travel",
+        "description": "Searches about combining work and travel"
+      }
+    ],
+    "items": [
+      {
+        "value": "digital nomad hotels penang",
+        "region": "MY",
+        "platform": "tiktok",
+        "topicRefs": [
+          "remote-work"
+        ]
+      }
+    ]
+  },
+  "mixedBatch": {
+    "topicMode": "explicit",
+    "topicDefinitions": [
+      {
+        "kind": "existing",
+        "ref": "family",
+        "topicId": "18700000-0000-4000-8000-000000000003"
+      },
+      {
+        "kind": "create",
+        "ref": "remote-work",
+        "name": "Remote work travel",
+        "description": "Searches about combining work and travel"
+      }
+    ],
+    "items": [
+      {
+        "value": "best family resorts penang",
+        "region": "MY",
+        "platform": "tiktok",
+        "topicRefs": [
+          "family"
+        ]
+      },
+      {
+        "value": "digital nomad hotels penang",
+        "region": "MY",
+        "platform": "tiktok",
+        "topicRefs": [
+          "remote-work"
+        ]
+      }
+    ]
+  },
+  "sharedNewTopic": {
+    "topicMode": "explicit",
+    "topicDefinitions": [
+      {
+        "kind": "create",
+        "ref": "family",
+        "name": "Family travel"
+      }
+    ],
+    "items": [
+      {
+        "value": "family resorts penang",
+        "region": "MY",
+        "platform": "tiktok",
+        "topicRefs": [
+          "family"
+        ]
+      },
+      {
+        "value": "family villas langkawi",
+        "region": "MY",
+        "platform": "tiktok",
+        "topicRefs": [
+          "family"
+        ]
+      }
+    ]
+  },
+  "omittedAuto": {
+    "type": "keyword",
+    "value": "best family resorts penang",
+    "region": "MY",
+    "platform": "tiktok"
+  }
+}
